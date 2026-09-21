@@ -1,6 +1,112 @@
 #include "utils.h"
 #include "libplacebo/utils/libav.h"
 
+#ifdef PL_HAVE_LAV_HDR
+static void test_invalid_hdr10plus_metadata(void)
+{
+    struct pl_hdr_metadata hdr = {
+        .scene_avg = 100.0f,
+    };
+    AVDynamicHDRPlus hdr10plus = {
+        .application_version = 1,
+        .num_windows = PL_ARRAY_SIZE(hdr10plus.params) + 1,
+    };
+    pl_map_hdr_metadata(&hdr, &(struct pl_av_hdr_metadata) {
+        .dhp = &hdr10plus,
+    });
+    REQUIRE_CMP(hdr.scene_avg, ==, 100.0f, "f");
+
+    hdr10plus.num_windows = 1;
+    hdr10plus.params[0].num_distribution_maxrgb_percentiles =
+        PL_ARRAY_SIZE(hdr10plus.params[0].distribution_maxrgb) + 1;
+    pl_map_hdr_metadata(&hdr, &(struct pl_av_hdr_metadata) {
+        .dhp = &hdr10plus,
+    });
+    REQUIRE_CMP(hdr.scene_avg, ==, 100.0f, "f");
+
+    hdr10plus.params[0].num_distribution_maxrgb_percentiles = 0;
+    hdr10plus.params[0].num_bezier_curve_anchors =
+        PL_ARRAY_SIZE(hdr10plus.params[0].bezier_curve_anchors) + 1;
+    pl_map_hdr_metadata(&hdr, &(struct pl_av_hdr_metadata) {
+        .dhp = &hdr10plus,
+    });
+    REQUIRE_CMP(hdr.scene_avg, ==, 100.0f, "f");
+
+    hdr10plus.params[0].num_bezier_curve_anchors = 0;
+    hdr10plus.params[0].average_maxrgb = (AVRational) {1, 2};
+    pl_map_hdr_metadata(&hdr, &(struct pl_av_hdr_metadata) {
+        .dhp = &hdr10plus,
+    });
+    REQUIRE_CMP(hdr.scene_avg, ==, 5000.0f, "f");
+}
+#endif
+
+#ifdef PL_HAVE_LAV_DOLBY_VISION
+static void test_checked_dovi_metadata(void)
+{
+    size_t metadata_size = 0;
+    AVDOVIMetadata *metadata = av_dovi_metadata_alloc(&metadata_size);
+    REQUIRE(metadata);
+
+    AVDOVIRpuDataHeader *header = av_dovi_get_header(metadata);
+    AVDOVIDataMapping *mapping = av_dovi_get_mapping(metadata);
+    AVDOVIColorMetadata *color = av_dovi_get_color(metadata);
+    header->bl_bit_depth = 10;
+    header->coef_log2_denom = 12;
+    header->disable_residual_flag = 1;
+    for (int c = 0; c < 3; c++) {
+        mapping->curves[c].num_pivots = 2;
+        mapping->curves[c].pivots[0] = 0;
+        mapping->curves[c].pivots[1] = 1023;
+        mapping->curves[c].mapping_idc[0] = AV_DOVI_MAPPING_POLYNOMIAL;
+        mapping->curves[c].poly_order[0] = 1;
+        color->ycc_to_rgb_offset[c] = (AVRational) {0, 1};
+    }
+    for (int n = 0; n < 9; n++) {
+        color->ycc_to_rgb_matrix[n] =
+            (AVRational) {(n % 4) == 0, 1};
+        color->rgb_to_lms_matrix[n] =
+            (AVRational) {(n % 4) == 0, 1};
+    }
+
+    AVFrame *frame = av_frame_alloc();
+    REQUIRE(frame);
+    frame->format = AV_PIX_FMT_YUV420P10LE;
+    AVFrameSideData *sd = av_frame_new_side_data(
+        frame, AV_FRAME_DATA_DOVI_METADATA, metadata_size);
+    REQUIRE(sd);
+    size_t header_offset = metadata->header_offset;
+    memcpy(sd->data, metadata, metadata_size);
+    av_free(metadata);
+
+    struct pl_color_space color_space = {0};
+    struct pl_color_repr repr = {0};
+    struct pl_dovi_metadata dovi = {0};
+    REQUIRE(pl_map_avframe_dovi_metadata(
+        &color_space, &repr, &dovi, frame));
+    REQUIRE_CMP(repr.sys, ==, PL_COLOR_SYSTEM_DOLBYVISION, "u");
+    REQUIRE_CMP(repr.levels, ==, PL_COLOR_LEVELS_LIMITED, "u");
+
+    uint8_t *aligned_data = sd->data;
+    sd->data++;
+    REQUIRE(!pl_map_avframe_dovi_metadata(
+        &color_space, &repr, &dovi, frame));
+    sd->data = aligned_data;
+
+    ((AVDOVIMetadata *) sd->data)->header_offset = metadata_size;
+    REQUIRE(!pl_map_avframe_dovi_metadata(
+        &color_space, &repr, &dovi, frame));
+
+    AVDOVIMetadata *side_metadata = (AVDOVIMetadata *) sd->data;
+    side_metadata->header_offset = header_offset;
+    side_metadata->num_ext_blocks = 2;
+    side_metadata->ext_block_size++;
+    REQUIRE(!pl_map_avframe_dovi_metadata(
+        &color_space, &repr, &dovi, frame));
+    av_frame_free(&frame);
+}
+#endif
+
 int main()
 {
     struct pl_plane_data data[4] = {0};
@@ -355,6 +461,13 @@ int main()
     pl_color_space_infer(&image.color);
     REQUIRE(pl_color_space_equal(&csp, &image.color));
     av_frame_free(&frame);
+
+#ifdef PL_HAVE_LAV_HDR
+    test_invalid_hdr10plus_metadata();
+#endif
+#ifdef PL_HAVE_LAV_DOLBY_VISION
+    test_checked_dovi_metadata();
+#endif
 
     // Test enum functions
     for (enum pl_color_system sys = 0; sys < PL_COLOR_SYSTEM_COUNT; sys++) {
