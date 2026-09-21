@@ -325,7 +325,7 @@ pl_pass vk_pass_create(pl_gpu gpu, const struct pl_pass_params *params)
         goto no_descriptors;
     if (num_desc > vk->props.limits.maxPerStageResources) {
         PL_ERR(gpu, "Pass with %d descriptors exceeds the maximum number of "
-               "per-stage resources %" PRIu32"!",
+               "per-stage resources %" PRIu32 "!",
                num_desc, vk->props.limits.maxPerStageResources);
         goto error;
     }
@@ -336,7 +336,7 @@ pl_pass vk_pass_create(pl_gpu gpu, const struct pl_pass_params *params)
 
 #define NUM_DS (PL_ARRAY_SIZE(pass_vk->dss))
 
-    int dsSize[PL_DESC_TYPE_COUNT] = {0};
+    uint32_t dsSize[PL_DESC_TYPE_COUNT] = {0};
     VkDescriptorSetLayoutBinding *bindings = pl_calloc_ptr(tmp, num_desc, bindings);
 
     uint32_t max_tex = vk->props.limits.maxPerStageDescriptorSampledImages,
@@ -355,18 +355,37 @@ pl_pass vk_pass_create(pl_gpu gpu, const struct pl_pass_params *params)
 
     for (int i = 0; i < num_desc; i++) {
         struct pl_desc *desc = &params->descriptors[i];
+        struct vk_ycbcr_sampler *sampler = desc->sampler_signature
+            ? vk_ycbcr_sampler_find(gpu, desc->sampler_signature)
+            : NULL;
+        if (desc->sampler_signature && !sampler) {
+            PL_ERR(gpu, "Missing immutable YCbCr sampler");
+            goto error;
+        }
+        if (sampler && desc->address_mode != PL_TEX_ADDRESS_CLAMP) {
+            PL_ERR(gpu, "YCbCr textures require clamp-to-edge sampling");
+            goto error;
+        }
+        if (sampler && !sampler->samplers[desc->sample_mode]) {
+            PL_ERR(gpu, "YCbCr sampler does not support "
+                   "the requested reconstruction filter");
+            goto error;
+        }
         if (!(*dsLimits[desc->type])--) {
             PL_ERR(gpu, "Pass exceeds the maximum number of per-stage "
                    "descriptors of type %u!", (unsigned) desc->type);
             goto error;
         }
 
-        dsSize[desc->type]++;
+        dsSize[desc->type] += sampler ? sampler->descriptor_count : 1;
         bindings[i] = (VkDescriptorSetLayoutBinding) {
             .binding = desc->binding,
             .descriptorType = dsType[desc->type],
             .descriptorCount = 1,
             .stageFlags = stageFlags[params->type],
+            .pImmutableSamplers = sampler
+                ? &sampler->samplers[desc->sample_mode]
+                : NULL,
         };
     }
 
@@ -664,6 +683,9 @@ static void vk_update_descriptor(pl_gpu gpu, struct vk_cmd *cmd, pl_pass pass,
     case PL_DESC_SAMPLED_TEX: {
         pl_tex tex = db.object;
         struct pl_tex_vk *tex_vk = PL_PRIV(tex);
+        struct vk_ycbcr_sampler *sampler = desc->sampler_signature
+            ? vk_ycbcr_sampler_find(gpu, desc->sampler_signature)
+            : NULL;
 
         vk_tex_barrier(gpu, cmd, tex, shaderStages[pass->params.type],
                        VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
@@ -672,7 +694,9 @@ static void vk_update_descriptor(pl_gpu gpu, struct vk_cmd *cmd, pl_pass pass,
 
         VkDescriptorImageInfo *iinfo = &pass_vk->dsiinfo[idx];
         *iinfo = (VkDescriptorImageInfo) {
-            .sampler = p->samplers[db.sample_mode][db.address_mode],
+            .sampler = sampler
+                ? sampler->samplers[desc->sample_mode]
+                : p->samplers[db.sample_mode][db.address_mode],
             .imageView = tex_vk->view,
             .imageLayout = tex_vk->layout,
         };

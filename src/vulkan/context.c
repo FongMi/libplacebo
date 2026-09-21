@@ -155,6 +155,10 @@ static const struct vk_ext vk_device_extensions[] = {
             PL_VK_DEV_FUN(SetHdrMetadataEXT),
             {0}
         },
+#ifdef VK_KHR_MAINTENANCE_6_EXTENSION_NAME
+    }, {
+        .name = VK_KHR_MAINTENANCE_6_EXTENSION_NAME,
+#endif
     }, {
         .name = VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME,
         .funs = (const struct vk_fun[]) {
@@ -231,6 +235,9 @@ const char * const pl_vulkan_recommended_extensions[] = {
 #endif
     VK_EXT_PCI_BUS_INFO_EXTENSION_NAME,
     VK_EXT_HDR_METADATA_EXTENSION_NAME,
+#ifdef VK_KHR_MAINTENANCE_6_EXTENSION_NAME
+    VK_KHR_MAINTENANCE_6_EXTENSION_NAME,
+#endif
     VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME,
 #ifdef VK_KHR_portability_subset
     VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME,
@@ -429,6 +436,7 @@ static const struct vk_fun vk_dev_funs[] = {
     PL_VK_DEV_FUN(CreateQueryPool),
     PL_VK_DEV_FUN(CreateRenderPass),
     PL_VK_DEV_FUN(CreateSampler),
+    PL_VK_DEV_FUN(CreateSamplerYcbcrConversion),
     PL_VK_DEV_FUN(CreateSemaphore),
     PL_VK_DEV_FUN(CreateShaderModule),
     PL_VK_DEV_FUN(DestroyBuffer),
@@ -447,6 +455,7 @@ static const struct vk_fun vk_dev_funs[] = {
     PL_VK_DEV_FUN(DestroyQueryPool),
     PL_VK_DEV_FUN(DestroyRenderPass),
     PL_VK_DEV_FUN(DestroySampler),
+    PL_VK_DEV_FUN(DestroySamplerYcbcrConversion),
     PL_VK_DEV_FUN(DestroySemaphore),
     PL_VK_DEV_FUN(DestroyShaderModule),
     PL_VK_DEV_FUN(DeviceWaitIdle),
