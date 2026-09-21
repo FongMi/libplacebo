@@ -639,9 +639,10 @@ static const char *retvals[] = {
 
 // libplacebo currently only allows 2D samplers for shader signatures
 static const char *samplers2D[] = {
-    [PL_SAMPLER_NORMAL]     = "sampler2D",
-    [PL_SAMPLER_RECT]       = "sampler2DRect",
-    [PL_SAMPLER_EXTERNAL]   = "samplerExternalOES",
+    [PL_SAMPLER_NORMAL]       = "sampler2D",
+    [PL_SAMPLER_RECT]         = "sampler2DRect",
+    [PL_SAMPLER_EXTERNAL]     = "samplerExternalOES",
+    [PL_SAMPLER_EXTERNAL_YUV] = "__samplerExternal2DY2YEXT",
 };
 
 ident_t sh_subpass(pl_shader sh, pl_shader sub)
