@@ -66,6 +66,9 @@ struct pl_vk {
     // Array of VkSamplers for every combination of sample/address modes
     VkSampler samplers[PL_TEX_SAMPLE_MODE_COUNT][PL_TEX_ADDRESS_MODE_COUNT];
 
+    PL_ARRAY(struct vk_ycbcr_sampler) ycbcr_samplers;
+    uint64_t next_sampler_signature;
+
     // To avoid spamming warnings
     bool warned_modless;
 
@@ -122,6 +125,18 @@ struct pl_tex_vk {
     bool may_invalidate;
     bool held;
 };
+
+struct vk_ycbcr_sampler {
+    uint64_t signature;
+    VkFormat format;
+    VkImageUsageFlags usage;
+    struct pl_vulkan_ycbcr_params params;
+    uint32_t descriptor_count;
+    VkSamplerYcbcrConversion conversion;
+    VkSampler samplers[PL_TEX_SAMPLE_MODE_COUNT];
+};
+
+struct vk_ycbcr_sampler *vk_ycbcr_sampler_find(pl_gpu, uint64_t signature);
 
 pl_tex vk_tex_create(pl_gpu, const struct pl_tex_params *);
 void vk_tex_deref(pl_gpu, pl_tex);

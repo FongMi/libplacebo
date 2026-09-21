@@ -261,6 +261,14 @@ static void vk_gpu_destroy(pl_gpu gpu)
         for (enum pl_tex_address_mode a = 0; a < PL_TEX_ADDRESS_MODE_COUNT; a++)
             vk->DestroySampler(vk->dev, p->samplers[s][a], PL_VK_ALLOC);
     }
+    for (int i = 0; i < p->ycbcr_samplers.num; i++) {
+        struct vk_ycbcr_sampler *sampler = &p->ycbcr_samplers.elem[i];
+        for (enum pl_tex_sample_mode s = 0;
+             s < PL_TEX_SAMPLE_MODE_COUNT; s++)
+            vk->DestroySampler(vk->dev, sampler->samplers[s], PL_VK_ALLOC);
+        vk->DestroySamplerYcbcrConversion(vk->dev, sampler->conversion,
+                                          PL_VK_ALLOC);
+    }
 
     pl_spirv_destroy(&p->spirv);
     pl_mutex_destroy(&p->recording);
