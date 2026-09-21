@@ -353,6 +353,11 @@ struct pl_vulkan_swapchain_params {
     // the "suboptimal" status indefinitely.
     bool allow_suboptimal;
 
+    // Do not request VK_IMAGE_USAGE_STORAGE_BIT for swapchain images. This
+    // may allow the presentation engine to choose a more compositable image
+    // layout at the cost of preventing direct compute shader output.
+    bool disable_storage;
+
     // Disable high-bit (10 or more) SDR formats. May help work around buggy
     // drivers which don't dither properly when outputting high bit depth
     // SDR backbuffers to 8-bit screens.

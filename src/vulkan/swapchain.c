@@ -672,7 +672,8 @@ caps_ready:
     // the swapchain usage flags with the format usage flags
     VkImageUsageFlags req_flags = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
                                   VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-    VkImageUsageFlags opt_flags = VK_IMAGE_USAGE_STORAGE_BIT;
+    VkImageUsageFlags opt_flags = p->params.disable_storage
+                                ? 0 : VK_IMAGE_USAGE_STORAGE_BIT;
 
     info->imageUsage = caps.supportedUsageFlags & (req_flags | opt_flags);
     VkFormatProperties fmtprop = {0};
