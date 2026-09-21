@@ -623,6 +623,15 @@ pl_tex pl_opengl_wrap(pl_gpu gpu, const struct pl_opengl_wrap_params *params)
         return NULL;
 
     struct pl_gl *p = PL_PRIV(gpu);
+    if (params->external_yuv &&
+        (!params->texture || params->target != GL_TEXTURE_EXTERNAL_OES ||
+         params->depth || p->gles_ver < 30 ||
+         !pl_opengl_has_ext(p->gl, "GL_OES_EGL_image_external") ||
+         !pl_opengl_has_ext(p->gl, "GL_EXT_YUV_target")))
+    {
+        PL_ERR(gpu, "Raw external YUV sampling is not supported");
+        return NULL;
+    }
     struct pl_tex_t *tex = pl_alloc_obj(NULL, tex, struct pl_tex_gl);
     struct pl_tex_gl *tex_gl = PL_PRIV(tex);
     *tex = (struct pl_tex_t) {
@@ -711,7 +720,11 @@ pl_tex pl_opengl_wrap(pl_gpu gpu, const struct pl_opengl_wrap_params *params)
             break;
 
         case GL_TEXTURE_RECTANGLE: tex->sampler_type = PL_SAMPLER_RECT; break;
-        case GL_TEXTURE_EXTERNAL_OES: tex->sampler_type = PL_SAMPLER_EXTERNAL; break;
+        case GL_TEXTURE_EXTERNAL_OES:
+            tex->sampler_type = params->external_yuv
+                              ? PL_SAMPLER_EXTERNAL_YUV
+                              : PL_SAMPLER_EXTERNAL;
+            break;
 
         default:
             PL_ERR(gpu, "Failed mapping texture target %u to any equivalent "
@@ -724,6 +737,7 @@ pl_tex pl_opengl_wrap(pl_gpu gpu, const struct pl_opengl_wrap_params *params)
     bool can_fbo = tex_gl->texture &&
                    (fmt->caps & PL_FMT_CAP_RENDERABLE) &&
                    tex->sampler_type != PL_SAMPLER_EXTERNAL &&
+                   tex->sampler_type != PL_SAMPLER_EXTERNAL_YUV &&
                    dims < 3;
 
     if (can_fbo && !tex_gl->fbo) {
