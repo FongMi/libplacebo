@@ -891,6 +891,20 @@ static struct pass *finalize_pass(pl_dispatch dp, pl_shader sh,
         struct pl_desc *desc = &params.descriptors[i];
         *desc = sh->descs.elem[i].desc;
         desc->binding = binding[pl_desc_namespace(dp->gpu, desc->type)]++;
+        if (desc->type == PL_DESC_SAMPLED_TEX) {
+            const struct pl_shader_desc *sd = &sh->descs.elem[i];
+            pl_tex tex = sd->binding.object;
+            desc->sampler_signature = tex->sampler_signature;
+            if (desc->sampler_signature) {
+                desc->address_mode = sd->binding.address_mode;
+                desc->sample_mode = sd->binding.sample_mode;
+                pl_hash_merge(&pass->signature, desc->sampler_signature);
+                pl_hash_merge(&pass->signature,
+                              (uint64_t) desc->address_mode);
+                pl_hash_merge(&pass->signature,
+                              (uint64_t) desc->sample_mode);
+            }
+        }
     }
 
     // Finalize the shader and look it up in the pass cache

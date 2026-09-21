@@ -175,6 +175,7 @@ struct vk_ctx {
     PL_VK_FUN(CreateQueryPool);
     PL_VK_FUN(CreateRenderPass);
     PL_VK_FUN(CreateSampler);
+    PL_VK_FUN(CreateSamplerYcbcrConversion);
     PL_VK_FUN(CreateSemaphore);
     PL_VK_FUN(CreateShaderModule);
     PL_VK_FUN(CreateSwapchainKHR);
@@ -195,6 +196,7 @@ struct vk_ctx {
     PL_VK_FUN(DestroyQueryPool);
     PL_VK_FUN(DestroyRenderPass);
     PL_VK_FUN(DestroySampler);
+    PL_VK_FUN(DestroySamplerYcbcrConversion);
     PL_VK_FUN(DestroySemaphore);
     PL_VK_FUN(DestroyShaderModule);
     PL_VK_FUN(DestroySwapchainKHR);

@@ -19,6 +19,214 @@
 
 VK_CB_FUNC_DEF(vk_tex_deref);
 
+struct vk_ycbcr_sampler *vk_ycbcr_sampler_find(pl_gpu gpu,
+                                                uint64_t signature)
+{
+    struct pl_vk *p = PL_PRIV(gpu);
+    for (int i = 0; i < p->ycbcr_samplers.num; i++) {
+        if (p->ycbcr_samplers.elem[i].signature == signature)
+            return &p->ycbcr_samplers.elem[i];
+    }
+    return NULL;
+}
+
+static bool ycbcr_params_equal(const struct vk_ycbcr_sampler *a,
+                               VkFormat format,
+                               VkImageUsageFlags usage,
+                               const struct pl_vulkan_ycbcr_params *b)
+{
+    const struct pl_vulkan_ycbcr_params *params = &a->params;
+    return a->format == format &&
+           a->usage == usage &&
+           params->external_format == b->external_format &&
+           !memcmp(&params->components, &b->components,
+                   sizeof(params->components)) &&
+           params->model == b->model &&
+           params->range == b->range &&
+           params->x_chroma_offset == b->x_chroma_offset &&
+           params->y_chroma_offset == b->y_chroma_offset &&
+           params->chroma_filter == b->chroma_filter &&
+           params->separate_reconstruction_filter ==
+               b->separate_reconstruction_filter &&
+           params->force_explicit_reconstruction ==
+               b->force_explicit_reconstruction &&
+           params->sample_depth == b->sample_depth;
+}
+
+#ifdef VK_KHR_MAINTENANCE_6_EXTENSION_NAME
+static bool vk_has_extension(struct vk_ctx *vk, const char *name)
+{
+    for (int i = 0; i < vk->exts.num; i++) {
+        if (strcmp(vk->exts.elem[i], name) == 0)
+            return true;
+    }
+    return false;
+}
+#endif
+
+static uint32_t external_ycbcr_descriptor_count(struct vk_ctx *vk)
+{
+#ifdef VK_KHR_MAINTENANCE_6_EXTENSION_NAME
+    bool maintenance6 =
+        vk_has_extension(vk, VK_KHR_MAINTENANCE_6_EXTENSION_NAME);
+#ifdef VK_API_VERSION_1_4
+    maintenance6 |= vk->api_ver >= VK_API_VERSION_1_4;
+#endif
+    if (maintenance6) {
+        VkPhysicalDeviceMaintenance6PropertiesKHR maintenance6_props = {
+            .sType =
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_6_PROPERTIES_KHR,
+        };
+        VkPhysicalDeviceProperties2 properties = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+            .pNext = &maintenance6_props,
+        };
+        vk->GetPhysicalDeviceProperties2(vk->physd, &properties);
+        if (maintenance6_props.maxCombinedImageSamplerDescriptorCount)
+            return maintenance6_props.maxCombinedImageSamplerDescriptorCount;
+    }
+#endif
+
+    // External formats did not expose an exact descriptor count before
+    // maintenance6. Four covers the implementation-defined YCbCr planes plus
+    // the optional alpha component.
+    return 4;
+}
+
+static uint32_t ycbcr_descriptor_count(pl_gpu gpu, VkFormat format,
+                                       VkImageUsageFlags usage)
+{
+    struct pl_vk *p = PL_PRIV(gpu);
+    struct vk_ctx *vk = p->vk;
+    if (format == VK_FORMAT_UNDEFINED)
+        return external_ycbcr_descriptor_count(vk);
+
+    VkSamplerYcbcrConversionImageFormatProperties ycbcr = {
+        .sType =
+            VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_IMAGE_FORMAT_PROPERTIES,
+    };
+    VkImageFormatProperties2 properties = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2,
+        .pNext = &ycbcr,
+    };
+    VkPhysicalDeviceImageFormatInfo2 info = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2,
+        .format = format,
+        .type = VK_IMAGE_TYPE_2D,
+        .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = usage,
+    };
+    VkResult res = vk->GetPhysicalDeviceImageFormatProperties2(
+        vk->physd, &info, &properties);
+    if (res != VK_SUCCESS) {
+        PL_ERR(gpu, "Failed querying YCbCr descriptor count for format %s: %s",
+               vk_fmt_name(format), vk_res_str(res));
+        return 0;
+    }
+    if (!ycbcr.combinedImageSamplerDescriptorCount) {
+        PL_ERR(gpu, "Driver returned no YCbCr descriptors for format %s",
+               vk_fmt_name(format));
+        return 0;
+    }
+    return ycbcr.combinedImageSamplerDescriptorCount;
+}
+
+static struct vk_ycbcr_sampler *vk_ycbcr_sampler_get(
+    pl_gpu gpu, VkFormat format, VkImageUsageFlags usage,
+    const struct pl_vulkan_ycbcr_params *params)
+{
+    struct pl_vk *p = PL_PRIV(gpu);
+    struct vk_ctx *vk = p->vk;
+
+    for (int i = 0; i < p->ycbcr_samplers.num; i++) {
+        struct vk_ycbcr_sampler *sampler = &p->ycbcr_samplers.elem[i];
+        if (ycbcr_params_equal(sampler, format, usage, params))
+            return sampler;
+    }
+
+    uint32_t descriptor_count = ycbcr_descriptor_count(gpu, format, usage);
+    if (!descriptor_count)
+        return NULL;
+
+    struct vk_ycbcr_sampler sampler = {
+        .signature = ++p->next_sampler_signature,
+        .format = format,
+        .usage = usage,
+        .params = *params,
+        .descriptor_count = descriptor_count,
+    };
+    if (!sampler.signature)
+        sampler.signature = ++p->next_sampler_signature;
+
+    const struct {
+        VkStructureType sType;
+        const void *pNext;
+        uint64_t externalFormat;
+    } external_format = {
+        .sType = VK_STRUCTURE_TYPE_EXTERNAL_FORMAT_ANDROID,
+        .externalFormat = params->external_format,
+    };
+    const VkSamplerYcbcrConversionCreateInfo conversion_info = {
+        .sType = VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_CREATE_INFO,
+        .pNext = params->external_format ? &external_format : NULL,
+        .format = format,
+        .ycbcrModel = params->model,
+        .ycbcrRange = params->range,
+        .components = params->components,
+        .xChromaOffset = params->x_chroma_offset,
+        .yChromaOffset = params->y_chroma_offset,
+        .chromaFilter = params->chroma_filter,
+        .forceExplicitReconstruction =
+            params->force_explicit_reconstruction,
+    };
+    VkResult res = vk->CreateSamplerYcbcrConversion(
+        vk->dev, &conversion_info, PL_VK_ALLOC, &sampler.conversion);
+    if (res != VK_SUCCESS)
+        goto error;
+
+    const VkSamplerYcbcrConversionInfo sampler_conversion = {
+        .sType = VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_INFO,
+        .conversion = sampler.conversion,
+    };
+    for (enum pl_tex_sample_mode s = 0;
+         s < PL_TEX_SAMPLE_MODE_COUNT; s++) {
+        VkFilter filter = s == PL_TEX_SAMPLE_LINEAR
+            ? VK_FILTER_LINEAR
+            : VK_FILTER_NEAREST;
+        if (!params->separate_reconstruction_filter &&
+            filter != params->chroma_filter)
+            continue;
+        const VkSamplerCreateInfo sampler_info = {
+            .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+            .pNext = &sampler_conversion,
+            .magFilter = filter,
+            .minFilter = filter,
+            .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+            .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+            .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+            .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+            .maxAnisotropy = 1.0,
+        };
+        res = vk->CreateSampler(vk->dev, &sampler_info, PL_VK_ALLOC,
+                                &sampler.samplers[s]);
+        if (res != VK_SUCCESS)
+            goto error;
+    }
+
+    PL_ARRAY_APPEND(gpu, p->ycbcr_samplers, sampler);
+    return &p->ycbcr_samplers.elem[p->ycbcr_samplers.num - 1];
+
+error:
+    for (enum pl_tex_sample_mode s = 0;
+         s < PL_TEX_SAMPLE_MODE_COUNT; s++)
+        vk->DestroySampler(vk->dev, sampler.samplers[s], PL_VK_ALLOC);
+    vk->DestroySamplerYcbcrConversion(vk->dev, sampler.conversion,
+                                      PL_VK_ALLOC);
+    PL_ERR(gpu, "Failed creating YCbCr sampler: %s",
+           vk_res_str(res));
+    return NULL;
+}
+
 void vk_tex_barrier(pl_gpu gpu, struct vk_cmd *cmd, pl_tex tex,
                     VkPipelineStageFlags2 stage, VkAccessFlags2 access,
                     VkImageLayout layout, uint32_t qf)
@@ -181,9 +389,24 @@ static bool vk_init_image(pl_gpu gpu, pl_tex tex, pl_debug_tag debug_tag)
             .usage = tex_vk->usage_flags & view_whitelist,
         };
 
+        VkSamplerYcbcrConversionInfo conversion_info = {
+            .sType = VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_INFO,
+        };
+        struct vk_ycbcr_sampler *ycbcr = NULL;
+        if (tex->sampler_signature) {
+            ycbcr = vk_ycbcr_sampler_find(gpu, tex->sampler_signature);
+            if (!ycbcr) {
+                PL_ERR(gpu, "Missing immutable YCbCr sampler");
+                goto error;
+            }
+            conversion_info.conversion = ycbcr->conversion;
+            conversion_info.pNext = &usage_info;
+        }
+
         const VkImageViewCreateInfo vinfo = {
             .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-            .pNext = &usage_info,
+            .pNext = ycbcr ? (void *) &conversion_info
+                           : (void *) &usage_info,
             .image = tex_vk->img,
             .viewType = viewType[tex_vk->type],
             .format = tex_vk->img_fmt,
@@ -1302,11 +1525,39 @@ skip_blocking:
 pl_tex pl_vulkan_wrap(pl_gpu gpu, const struct pl_vulkan_wrap_params *params)
 {
     pl_fmt fmt = NULL;
-    for (int i = 0; i < gpu->num_formats; i++) {
-        const struct vk_format **vkfmt = PL_PRIV(gpu->formats[i]);
-        if ((*vkfmt)->tfmt == params->format) {
-            fmt = gpu->formats[i];
-            break;
+    struct vk_ycbcr_sampler *ycbcr = NULL;
+    if (params->ycbcr) {
+        bool external = params->format == VK_FORMAT_UNDEFINED;
+        if (external != !!params->ycbcr->external_format ||
+            params->ycbcr->sample_depth <= 0 ||
+            !(params->usage & VK_IMAGE_USAGE_SAMPLED_BIT) ||
+            (params->aspect &&
+             params->aspect != VK_IMAGE_ASPECT_COLOR_BIT)) {
+            PL_ERR(gpu, "Invalid YCbCr wrap parameters");
+            return NULL;
+        }
+        fmt = pl_find_fmt(gpu, PL_FMT_UNORM, 4,
+                          params->ycbcr->sample_depth, 0,
+                          PL_FMT_CAP_SAMPLEABLE | PL_FMT_CAP_LINEAR);
+        if (!fmt) {
+            // The format is only a shader-interface description for the
+            // opaque external image. A floating-point sampler has identical
+            // GLSL semantics and is a valid fallback when no sufficiently
+            // precise four-component UNORM format is advertised.
+            fmt = pl_find_fmt(gpu, PL_FMT_FLOAT, 4,
+                              params->ycbcr->sample_depth, 0,
+                              PL_FMT_CAP_SAMPLEABLE | PL_FMT_CAP_LINEAR);
+        }
+        if (fmt)
+            ycbcr = vk_ycbcr_sampler_get(gpu, params->format, params->usage,
+                                         params->ycbcr);
+    } else {
+        for (int i = 0; i < gpu->num_formats; i++) {
+            const struct vk_format **vkfmt = PL_PRIV(gpu->formats[i]);
+            if ((*vkfmt)->tfmt == params->format) {
+                fmt = gpu->formats[i];
+                break;
+            }
         }
     }
 
@@ -1315,6 +1566,8 @@ pl_tex pl_vulkan_wrap(pl_gpu gpu, const struct pl_vulkan_wrap_params *params)
                "with format %s", vk_fmt_name(params->format));
         return NULL;
     }
+    if (params->ycbcr && !ycbcr)
+        return NULL;
 
     VkImageUsageFlags usage = params->usage;
     if (fmt->num_planes)
@@ -1336,6 +1589,8 @@ pl_tex pl_vulkan_wrap(pl_gpu gpu, const struct pl_vulkan_wrap_params *params)
         .user_data      = params->user_data,
         .debug_tag      = params->debug_tag,
     };
+    if (ycbcr)
+        tex->sampler_signature = ycbcr->signature;
 
     // Mask out capabilities not permitted by the `pl_fmt`
 #define MASK(field, cap)                                                        \
