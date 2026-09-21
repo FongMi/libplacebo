@@ -735,6 +735,7 @@ enum pl_sampler_type {
     PL_SAMPLER_NORMAL,      // gsampler2D, gsampler3D etc.
     PL_SAMPLER_RECT,        // gsampler2DRect
     PL_SAMPLER_EXTERNAL,    // gsamplerExternalOES
+    PL_SAMPLER_EXTERNAL_YUV, // __samplerExternal2DY2YEXT (raw YUV)
     PL_SAMPLER_TYPE_COUNT,
 };
 
