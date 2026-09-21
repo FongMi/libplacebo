@@ -280,10 +280,12 @@ void vk_tex_barrier(pl_gpu gpu, struct vk_cmd *cmd, pl_tex tex,
         barr.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     }
 
-    // A synchronization point without any access stage of its own has to
-    // wait for all commands instead, a wait limited to no stage orders nothing
+    // Ownership transfers are not scoped to a pipeline stage. External
+    // dependencies must complete before an acquire, including its layout
+    // transition. A synchronization point with no access stage also needs
+    // an all-commands wait; waiting at NONE orders nothing.
     VkPipelineStageFlags2 wait_stage = stage;
-    if (wait_stage == VK_PIPELINE_STAGE_2_NONE)
+    if (is_xfer || wait_stage == VK_PIPELINE_STAGE_2_NONE)
         wait_stage = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
 
     if (tex_vk->ext_deps.num) {
