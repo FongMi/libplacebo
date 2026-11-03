@@ -648,9 +648,11 @@ static struct sampler_info sample_src_info(struct pass_state *pass,
     }
 
     if (params->correct_subpixel_offsets) {
-        if (!info.dir_sep[0] && fabsf(src->rect.x0) > 1e-6f)
+        if (!info.dir_sep[0] &&
+            fabsf(src->rect.x0 - roundf(src->rect.x0)) > 1e-6f)
             info.dir_sep[0] = SAMPLER_UP;
-        if (!info.dir_sep[1] && fabsf(src->rect.y0) > 1e-6f)
+        if (!info.dir_sep[1] &&
+            fabsf(src->rect.y0 - roundf(src->rect.y0)) > 1e-6f)
             info.dir_sep[1] = SAMPLER_UP;
     }
 
@@ -725,6 +727,20 @@ static void dispatch_sampler(struct pass_state *pass, pl_shader sh,
     pl_shader_obj *lut = NULL;
     switch (info.dir) {
     case SAMPLER_NOOP:
+        // Plane sampling may also implement the main scaler via free sampling.
+        if (usage == SAMPLER_PLANE && !target_tex) {
+            const pl_rect2df rect = pass->ref_rect;
+            if (fabsf(pl_rect_w(rect)) != abs(pl_rect_w(pass->dst_rect)) ||
+                fabsf(pl_rect_h(rect)) != abs(pl_rect_h(pass->dst_rect)))
+                goto fallback;
+        }
+        // Preserve exact texel centers without hardware interpolation error.
+        if (src->rect.x0 == roundf(src->rect.x0) &&
+            src->rect.y0 == roundf(src->rect.y0))
+        {
+            pl_shader_sample_nearest(sh, src);
+            return;
+        }
         goto fallback;
     case SAMPLER_DOWN:
         lut = &sampler->downscaler_state;
@@ -2226,7 +2242,10 @@ static bool pass_scale_main(struct pass_state *pass)
         goto done;
     }
 
-    if (info.type == SAMPLER_DIRECT && !need_fbo) {
+    if (info.type == SAMPLER_DIRECT && !need_fbo &&
+        src.rect.x0 == 0.0f && src.rect.y0 == 0.0f &&
+        src.rect.x1 == img->w && src.rect.y1 == img->h)
+    {
         img->w = src.new_w;
         img->h = src.new_h;
         img->rect = new_rect;

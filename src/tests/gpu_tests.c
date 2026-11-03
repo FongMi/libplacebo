@@ -2366,6 +2366,77 @@ static void pl_test_host_ptr(pl_gpu gpu)
 #endif // unix
 }
 
+static void pl_render_sampling_tests(pl_gpu gpu)
+{
+    pl_fmt fmt = pl_find_fmt(gpu, PL_FMT_FLOAT, 4, 16, 16,
+        PL_FMT_CAP_SAMPLEABLE | PL_FMT_CAP_LINEAR | PL_FMT_CAP_RENDERABLE |
+        PL_FMT_CAP_HOST_READABLE);
+    if (!fmt)
+        return;
+
+    enum { W = 128, H = 96 };
+    uint16_t data[W * H * 4], out[W * H * 4];
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            for (int c = 0; c < 3; c++)
+                data[(y * W + x) * 4 + c] = (x + y + c) % 2 ? 0x3c00 : 0;
+            data[(y * W + x) * 4 + 3] = 0x3c00;
+        }
+    }
+
+    pl_tex src = pl_tex_create(gpu, pl_tex_params(
+        .w = W, .h = H, .format = fmt, .sampleable = true, .initial_data = data,
+    ));
+    pl_tex dst = NULL;
+    REQUIRE(src);
+    pl_renderer rr = pl_renderer_create(gpu->log, gpu);
+    for (int test = 0; test < 4; test++) {
+        const bool cropped = test == 1 || test == 2;
+        const int width = cropped ? 64 : test == 3 ? W / 2 : W;
+        const int height = cropped ? 64 : test == 3 ? H / 2 : H;
+        const float offset = test == 2 ? 0.25f : 0.0f;
+        printf("- testing float sampling, case %d, offset %.2f\n", test, offset);
+        REQUIRE(pl_tex_recreate(gpu, &dst, pl_tex_params(
+            .w = width, .h = height, .format = fmt,
+            .renderable = true, .host_readable = true,
+        )));
+        struct pl_frame image = {
+            .num_planes = 1,
+            .planes[0] = { .texture = src, .components = 4,
+                           .component_mapping = {0, 1, 2, 3} },
+            .repr = pl_color_repr_rgb,
+            .color = pl_color_space_bt709,
+            .crop = { cropped ? 32 + offset : 0, cropped ? 16 + offset : 0,
+                      cropped ? 96 + offset : W, cropped ? 80 + offset : H },
+        };
+        image.color.transfer = PL_COLOR_TRC_GAMMA22;
+        struct pl_frame target = image;
+        target.planes[0].texture = dst;
+        target.crop = (pl_rect2df) { 0, 0, width, height };
+        struct pl_render_params params = pl_render_fast_params;
+        params.upscaler = &pl_filter_bilinear;
+        params.correct_subpixel_offsets = true;
+        REQUIRE(pl_render_image(rr, &image, &target, &params));
+        REQUIRE(pl_tex_download(gpu, pl_tex_transfer_params(.tex = dst, .ptr = out)));
+        for (int y = 0; y < height - (test == 2); y++) {
+            for (int x = 0; x < width - (test == 2); x++) {
+                for (int c = 0; c < 4; c++) {
+                    uint16_t expect = c == 3 || (x + y + c) % 2 ? 0x3c00 : 0;
+                    if (test == 2 && c != 3)
+                        expect = expect ? 0x3900 : 0x3600; // 0.625 or 0.375
+                    if (test == 3 && c != 3)
+                        expect = 0x3800; // 0.5
+                    REQUIRE_CMP(out[(y * width + x) * 4 + c], ==, expect, "u");
+                }
+            }
+        }
+        REQUIRE(pl_renderer_get_errors(rr).errors == PL_RENDER_ERR_NONE);
+    }
+    pl_renderer_destroy(&rr);
+    pl_tex_destroy(gpu, &src);
+    pl_tex_destroy(gpu, &dst);
+}
+
 // At 1:1 scale, the renderer drops sub-pixel offsets from the source crop,
 // so these must round to the nearest pixel. In particular, float error just
 // below a whole pixel must not shift the image by an entire pixel.
@@ -2944,6 +3015,7 @@ void gpu_shader_tests(pl_gpu gpu)
 #endif
     pl_scaler_tests(gpu);
     pl_render_tests(gpu);
+    pl_render_sampling_tests(gpu);
     pl_render_offset_tests(gpu);
     pl_render_bits_tests(gpu);
     pl_render_deband_tests(gpu);
