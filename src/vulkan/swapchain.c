@@ -21,10 +21,12 @@
 #include "utils.h"
 #include "gpu.h"
 #include "swapchain.h"
+#include "swapchain_geometry.h"
 #include "pl_thread.h"
 
 struct vk_swapchain {
     VkSwapchainKHR swapchain;
+    pl_rotation rotation;
     // state of the images:
     PL_ARRAY(VkImage) vkimages;     // VkImages waiting to be wrapped
     PL_ARRAY(pl_tex) images;        // pl_tex wrappers for the VkImages
@@ -541,7 +543,9 @@ static int vk_sw_latency(pl_swapchain sw)
 }
 
 static bool update_swapchain_info(struct priv *p, VkSwapchainCreateInfoKHR *info,
-                                  int w, int h)
+                                  int w, int h,
+                                  struct vk_swapchain_geometry *geometry,
+                                  enum pl_alpha_mode *alpha)
 {
     struct vk_ctx *vk = p->vk;
 
@@ -594,10 +598,11 @@ caps_ready:
         {VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR,         PL_ALPHA_UNKNOWN},
     };
 
+    info->compositeAlpha = 0;
     for (int i = 0; i < PL_ARRAY_SIZE(alphaModes); i++) {
         if (caps.supportedCompositeAlpha & alphaModes[i].vk_mode) {
             info->compositeAlpha = alphaModes[i].vk_mode;
-            p->color_repr.alpha = alphaModes[i].pl_mode;
+            *alpha = alphaModes[i].pl_mode;
             PL_DEBUG(vk, "Requested alpha compositing mode: %s",
                      vk_alpha_mode(info->compositeAlpha));
             break;
@@ -610,28 +615,22 @@ caps_ready:
         goto error;
     }
 
-    // Note: We could probably also allow picking a surface transform that
-    // flips the framebuffer and set `pl_swapchain_frame.flipped`, but this
-    // doesn't appear to be necessary for any vulkan implementations.
-    static const VkSurfaceTransformFlagsKHR rotModes[] = {
-        VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR,
-        VK_SURFACE_TRANSFORM_INHERIT_BIT_KHR,
-    };
-
-    for (int i = 0; i < PL_ARRAY_SIZE(rotModes); i++) {
-        if (caps.supportedTransforms & rotModes[i]) {
-            info->preTransform = rotModes[i];
-            PL_DEBUG(vk, "Requested surface transform: %s",
-                     vk_surface_transform(info->preTransform));
-            break;
-        }
-    }
-
-    if (!info->preTransform) {
-        PL_ERR(vk, "Failed picking surface transform mode (caps: 0x%x)",
-               caps.supportedTransforms);
+    // The prototype retains the last successful storage geometry, even if a
+    // later creation fails and there is no active swapchain. Convert it back
+    // to logical coordinates before using it as the unknown-size fallback.
+    VkExtent2D previous = info->imageExtent;
+    if (p->params.pre_rotate &&
+        (info->preTransform == VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR ||
+         info->preTransform == VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR))
+        PL_SWAP(previous.width, previous.height);
+    if (!vk_swapchain_geometry(&caps, p->params.pre_rotate, w, h,
+                               previous.width, previous.height, geometry)) {
+        PL_ERR(vk, "Failed resolving swapchain size or surface transform (0x%x)",
+               caps.currentTransform);
         goto error;
     }
+    info->preTransform = geometry->transform;
+    info->imageExtent = geometry->extent;
 
     // Image count as required
     PL_DEBUG(vk, "Requested image count: %d (min %d max %d)",
@@ -646,26 +645,6 @@ caps_ready:
              w, h, caps.minImageExtent.width, caps.minImageExtent.height,
              caps.currentExtent.width, caps.currentExtent.height,
              caps.maxImageExtent.width, caps.maxImageExtent.height);
-
-    // Default the requested size based on the reported extent
-    if (caps.currentExtent.width != 0xFFFFFFFF)
-        w = PL_DEF(w, caps.currentExtent.width);
-    if (caps.currentExtent.height != 0xFFFFFFFF)
-        h = PL_DEF(h, caps.currentExtent.height);
-
-    // Otherwise, re-use the existing size if available
-    w = PL_DEF(w, info->imageExtent.width);
-    h = PL_DEF(h, info->imageExtent.height);
-
-    if (!w || !h) {
-        PL_ERR(vk, "Failed resizing swapchain: unknown size?");
-        goto error;
-    }
-
-    // Clamp the extent based on the supported limits
-    w = PL_CLAMP(w, caps.minImageExtent.width,  caps.maxImageExtent.width);
-    h = PL_CLAMP(h, caps.minImageExtent.height, caps.maxImageExtent.height);
-    info->imageExtent = (VkExtent2D) { w, h };
 
     // We just request whatever makes sense, and let the pl_vk decide what
     // pl_tex_params that translates to. That said, we still need to intersect
@@ -755,10 +734,11 @@ static bool vk_sw_recreate(pl_swapchain sw, int w, int h)
     uint32_t num_images = 0;
     char name[32];
 
-    if (!update_swapchain_info(p, &p->protoInfo, w, h))
-        return false;
-
     VkSwapchainCreateInfoKHR sinfo = p->protoInfo;
+    struct vk_swapchain_geometry geometry;
+    enum pl_alpha_mode alpha;
+    if (!update_swapchain_info(p, &sinfo, w, h, &geometry, &alpha))
+        return false;
 
     VkSwapchainPresentModesCreateInfoKHR pminfo = {
         .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODES_CREATE_INFO_KHR,
@@ -777,11 +757,6 @@ static bool vk_sw_recreate(pl_swapchain sw, int w, int h)
     if (vk->AcquireFullScreenExclusiveModeEXT)
         vk_link_struct(&sinfo, &fsinfo);
 #endif
-
-    p->suboptimal = false;
-    p->needs_recreate = false;
-    p->cur_width = sinfo.imageExtent.width;
-    p->cur_height = sinfo.imageExtent.height;
 
     PL_DEBUG(sw, "(Re)creating swapchain of size %dx%d",
              sinfo.imageExtent.width,
@@ -845,6 +820,18 @@ static bool vk_sw_recreate(pl_swapchain sw, int w, int h)
         PL_ARRAY_APPEND(current, current->fences_out, fence);
     }
 
+    // Publish geometry only after the new swapchain is fully initialized.
+    // The prototype must not retain pointers to stack-allocated extension data.
+    p->protoInfo = sinfo;
+    p->protoInfo.pNext = NULL;
+    p->protoInfo.oldSwapchain = VK_NULL_HANDLE;
+    p->cur_width = geometry.width;
+    p->cur_height = geometry.height;
+    current->rotation = geometry.rotation;
+    p->color_repr.alpha = alpha;
+    p->suboptimal = false;
+    p->needs_recreate = false;
+
     // Note: `p->color_space.hdr` is (re-)applied by `set_hdr_metadata`
     map_color_space(sinfo.imageColorSpace, &p->color_space);
 
@@ -866,6 +853,7 @@ error:
     PL_ERR(vk, "Failed (re)creating swapchain!");
     swapchain_destroy(sw, &p->current, UINT64_MAX);
     p->cur_width = p->cur_height = 0;
+    p->needs_recreate = true;
     return false;
 }
 
@@ -916,6 +904,7 @@ static bool vk_sw_start_frame(pl_swapchain sw,
             *out_frame = (struct pl_swapchain_frame) {
                 .fbo = p->current->images.elem[imgidx],
                 .flipped = false,
+                .rotation = p->current->rotation,
                 .color_repr = p->color_repr,
                 .color_space = p->color_space,
             };
@@ -1065,7 +1054,21 @@ static bool vk_sw_resize(pl_swapchain sw, int *width, int *height)
     bool width_changed = *width && *width != p->cur_width,
          height_changed = *height && *height != p->cur_height;
 
-    if (p->suboptimal || p->needs_recreate || width_changed || height_changed)
+    bool recreate = p->suboptimal || p->needs_recreate || width_changed || height_changed;
+    if (p->params.pre_rotate && !recreate) {
+        // Same-sized rotations (e.g. 180 degrees) cannot be detected by size.
+        // Query on explicit resize, not on every frame or SUBOPTIMAL result.
+        VkSurfaceCapabilitiesKHR caps;
+        VkResult res = p->vk->GetPhysicalDeviceSurfaceCapabilitiesKHR(
+            p->vk->physd, p->surf, &caps);
+        if (res != VK_SUCCESS) {
+            PL_ERR(sw, "Failed querying surface orientation: %s", vk_res_str(res));
+            ok = false;
+        } else {
+            recreate = caps.currentTransform != p->protoInfo.preTransform;
+        }
+    }
+    if (ok && recreate)
         ok = vk_sw_recreate(sw, *width, *height);
 
     *width = p->cur_width;
