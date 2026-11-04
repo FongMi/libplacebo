@@ -27,6 +27,7 @@ components.set('vk-proc-addr', vulkan_link.allowed())
 build_deps += vulkan_headers
 
 if vulkan_build.allowed()
+  tests += 'vulkan_geometry.c'
   sources += [
     'vulkan/command.c',
     'vulkan/context.c',
