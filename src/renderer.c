@@ -4576,6 +4576,7 @@ void pl_frame_from_swapchain(struct pl_frame *out_frame,
         .crop = { 0, 0, fbo->params.w, fbo->params.h },
         .repr = frame->color_repr,
         .color = frame->color_space,
+        .rotation = frame->rotation,
     };
 }
 

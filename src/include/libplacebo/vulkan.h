@@ -381,6 +381,18 @@ struct pl_vulkan_swapchain_params {
     // be used to prefer formats with higher color bit depth. This is a hint,
     // if no matching format is found, lower bit depths will be accepted.
     uint8_t color_bits;
+
+    // Render with the surface's current pure rotation (0/90/180/270 degrees)
+    // already applied. Unsupported mirrored or inherited transforms fail.
+    // Defaults to false, preserving the unrotated framebuffer convention.
+    //
+    // With this enabled, pl_swapchain_resize takes and returns logical display
+    // dimensions; the framebuffer's storage dimensions may be transposed.
+    // Call resize on orientation changes even if the logical size is unchanged.
+    // A zero dimension retains the usual current/unknown-size query semantics.
+    // Render using pl_swapchain_frame.rotation (or pl_frame_from_swapchain),
+    // and account for target rotation when setting an aspect-preserving crop.
+    bool pre_rotate;
 };
 
 #define pl_vulkan_swapchain_params(...) (&(struct pl_vulkan_swapchain_params) { __VA_ARGS__ })

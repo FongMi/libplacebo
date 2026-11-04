@@ -5,8 +5,42 @@ static int irand()
     return rand() - RAND_MAX / 2;
 }
 
+static void aspect_rotation_tests(void)
+{
+    const pl_rect2df rects[] = {
+        {0, 0, 96, 64}, {7, 11, 103, 75},
+        {103, 11, 7, 75}, {7, 75, 103, 11}, {103, 75, 7, 11},
+        {-7.25f, 11.5f, 88.75f, 75.5f},
+    };
+    const float aspects[] = {48.0f / 80.0f, 16.0f / 9.0f, 1.0f};
+    const float panscans[] = {0.0f, 0.5f, 1.0f};
+    const pl_rotation rotations[] = {0, 1, 2, 3, -1, -4, 4, 5};
+    for (int i = 0; i < PL_ARRAY_SIZE(rects); i++) {
+        for (int a = 0; a < PL_ARRAY_SIZE(aspects); a++) {
+            for (int p = 0; p < PL_ARRAY_SIZE(panscans); p++) {
+                pl_rect2df expected = rects[i];
+                pl_rect2df_aspect_set(&expected, aspects[a], panscans[p]);
+                for (int r = 0; r < PL_ARRAY_SIZE(rotations); r++) {
+                    pl_rotation rot = rotations[r];
+                    pl_rect2df actual = rects[i];
+                    if (rot % PL_ROTATION_180)
+                        actual = (pl_rect2df) {actual.y0, actual.x0, actual.y1, actual.x1};
+                    pl_rect2df_aspect_set_rot(&actual, aspects[a], rot, panscans[p]);
+                    if (rot % PL_ROTATION_180)
+                        actual = (pl_rect2df) {actual.y0, actual.x0, actual.y1, actual.x1};
+                    REQUIRE_CMP(actual.x0, ==, expected.x0, "f");
+                    REQUIRE_CMP(actual.y0, ==, expected.y0, "f");
+                    REQUIRE_CMP(actual.x1, ==, expected.x1, "f");
+                    REQUIRE_CMP(actual.y1, ==, expected.y1, "f");
+                }
+            }
+        }
+    }
+}
+
 int main()
 {
+    aspect_rotation_tests();
     pl_log log = pl_test_logger();
     pl_log_update(log, NULL);
     pl_log_destroy(&log);
