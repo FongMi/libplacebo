@@ -1067,6 +1067,29 @@ PL_API bool pl_render_image_mix_source(pl_renderer rr,
                                        const struct pl_source_peak_context *source,
                                        const struct pl_custom_frame_mixer *mixer);
 
+#define PL_HAVE_FRAME_SHADER_MIXER 1
+
+struct pl_frame_shader_mixer {
+    void *priv;
+    // Append a color-producing shader with no input signature to the supplied
+    // shader. Its output is full-size premultiplied display-linear RGBA in the
+    // same representation as the prepared views. Return false on failure.
+    // The renderer owns the shader. Do not dispatch, abort or reset it here.
+    // The prepared views are borrowed through final output.
+    bool (*mix)(void *priv, const struct pl_rendered_mix *images, pl_shader shader);
+};
+
+// Shader form of pl_render_image_mix_source with a required custom mixer.
+// It has the same source-time, geometry, overlay and failure semantics.
+// The renderer appends the final output stages without materializing a
+// full-size mixed texture. A declared shader output size must match the views.
+PL_API bool pl_render_image_mix_source_shader(pl_renderer rr,
+                                             const struct pl_frame_mix *images,
+                                             const struct pl_frame *target,
+                                             const struct pl_render_params *params,
+                                             const struct pl_source_peak_context *source,
+                                             const struct pl_frame_shader_mixer *mixer);
+
 // Direct single-image equivalent of pl_render_image_mix_source with no mixer.
 // source->ids points to one native source ID whose snapshot applies to image;
 // current_id may identify a different submitted source. The image may contain
