@@ -3768,6 +3768,13 @@ static void custom_mix_dovi_tests(pl_gpu gpu, pl_tex src, pl_tex dst)
 }
 #endif
 
+static bool custom_mix_field_shader(void *priv, const struct pl_rendered_mix *mix,
+                                    pl_shader sh)
+{
+    pl_tex field = custom_mix_callback(priv, mix);
+    return pl_shader_sample_direct(sh, pl_sample_src(.tex = field));
+}
+
 static void custom_mix_field_tests(pl_gpu gpu, pl_fmt fmt)
 {
     enum { W = 16, H = 12, N = W * H * 4 };
@@ -3799,6 +3806,9 @@ static void custom_mix_field_tests(pl_gpu gpu, pl_fmt fmt)
     };
     struct custom_mix_test test = {.count = 2, .timestamps = pts};
     struct pl_custom_frame_mixer mixer = {.priv = &test, .mix = custom_mix_callback};
+    struct pl_frame_shader_mixer shader_mixer = {
+        .priv = &test, .mix = custom_mix_field_shader,
+    };
     struct pl_render_params params = pl_render_default_params;
     params.peak_detect_params = NULL;
     params.dither_params = NULL;
@@ -3835,13 +3845,20 @@ static void custom_mix_field_tests(pl_gpu gpu, pl_fmt fmt)
             REQUIRE(pl_render_image_mix_source(rr, &input, &target, &params, &context, &mixer));
             custom_mix_download(gpu, dst, actual);
             custom_mix_compare(actual, expected, N);
+            uint64_t content[] = {test.ids[0], test.ids[1]};
+            REQUIRE(pl_render_image_mix_source_shader(rr, &input, &target, &params,
+                                                      &context, &shader_mixer));
+            REQUIRE_MEMEQ(test.ids, content, sizeof(content));
+            custom_mix_download(gpu, dst, actual);
+            custom_mix_compare(actual, expected, N);
         }
         int calls = test.calls;
         fields[1].field = first;
         REQUIRE(!pl_render_image_mix_source(rr, &input, &target, &params, &context, &mixer));
         fields[1].field = pl_field_other(first);
         params.deinterlace_params = &weave;
-        REQUIRE(!pl_render_image_mix_source(rr, &input, &target, &params, &context, &mixer));
+        REQUIRE(!pl_render_image_mix_source_shader(rr, &input, &target, &params,
+                                                   &context, &shader_mixer));
         params.deinterlace_params = NULL;
         params.peak_detect_params = NULL;
         REQUIRE(!pl_render_image_mix_custom(rr, &input, &target, &params, &mixer));
@@ -3861,14 +3878,16 @@ static void custom_mix_field_tests(pl_gpu gpu, pl_fmt fmt)
     signatures[1] = 6;
     params.deinterlace_params = &pl_deinterlace_default_params;
     params.peak_detect_params = &pl_peak_detect_default_params;
-    REQUIRE(pl_render_image_mix_source(rr, &input, &target, &params, &context, &mixer));
+    REQUIRE(pl_render_image_mix_source_shader(rr, &input, &target, &params,
+                                              &context, &shader_mixer));
     uint64_t cached[] = {test.ids[0], test.ids[1]};
     for (int i = 0; i < 2; i++)
         REQUIRE(neighbors[i].acquired == 1 && neighbors[i].released == 1);
 
     fields[1].next = &refs[0];
     signatures[1] = 7;
-    REQUIRE(pl_render_image_mix_source(rr, &input, &target, &params, &context, &mixer));
+    REQUIRE(pl_render_image_mix_source_shader(rr, &input, &target, &params,
+                                              &context, &shader_mixer));
     REQUIRE(test.ids[0] == cached[0] && test.ids[1] != cached[1]);
     REQUIRE(neighbors[0].acquired == 2 && neighbors[0].released == 2);
     REQUIRE(neighbors[1].acquired == 1 && neighbors[1].released == 1);
@@ -3879,7 +3898,8 @@ static void custom_mix_field_tests(pl_gpu gpu, pl_fmt fmt)
     fields[1].release = custom_mix_release;
     fields[1].user_data = &output_owner;
     neighbors[0].fail = true;
-    REQUIRE(pl_render_image_mix_source(rr, &input, &target, &params, &context, &mixer));
+    REQUIRE(pl_render_image_mix_source_shader(rr, &input, &target, &params,
+                                              &context, &shader_mixer));
     REQUIRE(output_owner.acquired == 1 && output_owner.released == 1);
     REQUIRE(neighbors[0].acquired == 2 && neighbors[0].released == 2);
     neighbors[0].fail = false;
@@ -3938,6 +3958,10 @@ static void custom_mix_field_tests(pl_gpu gpu, pl_fmt fmt)
             custom_mix_download(gpu, dst, actual);
             custom_mix_compare(actual, expected, N);
             REQUIRE(test.ids[0] != test.ids[1]);
+            REQUIRE(pl_render_image_mix_source_shader(rr, &input, &target, &params,
+                                                      &context, &shader_mixer));
+            custom_mix_download(gpu, dst, actual);
+            custom_mix_compare(actual, expected, N);
             struct pl_hdr_metadata measured = {0}, reference = {0};
             REQUIRE(pl_source_peak_get_hdr_metadata(state, context.epoch, 1, &measured));
             REQUIRE(pl_source_peak_get_hdr_metadata(oracle_state, oracle_context.epoch,
@@ -3965,7 +3989,8 @@ static void custom_mix_field_tests(pl_gpu gpu, pl_fmt fmt)
     hlg_oracle.peak_detect_params = NULL;
     REQUIRE(pl_render_image(oracle, frames[test.reference], &target, &hlg_oracle));
     custom_mix_download(gpu, dst, expected);
-    REQUIRE(pl_render_image_mix_source(rr, &input, &target, &params, &context, &mixer));
+    REQUIRE(pl_render_image_mix_source_shader(rr, &input, &target, &params,
+                                              &context, &shader_mixer));
     REQUIRE(test.calls == calls + 1);
     custom_mix_download(gpu, dst, actual);
     custom_mix_compare(actual, expected, N);

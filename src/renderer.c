@@ -4644,9 +4644,11 @@ static bool same_field_view(const struct pl_frame *a, const struct pl_frame *b)
 static bool render_image_mix(pl_renderer rr, const struct pl_frame_mix *images,
                               const struct pl_frame *ptarget,
                               const struct pl_render_params *params,
-                              const struct pl_custom_frame_mixer *custom,
-                              const struct pl_source_peak_context *source)
+                              const struct pl_custom_frame_mixer *texture_mixer,
+                              const struct pl_source_peak_context *source,
+                              const struct pl_frame_shader_mixer *shader_mixer)
 {
+    bool custom = texture_mixer || shader_mixer;
     const char *failure = "configuration";
     if (!custom && !images->num_frames)
         return pl_render_image(rr, NULL, ptarget, params);
@@ -4664,7 +4666,7 @@ static bool render_image_mix(pl_renderer rr, const struct pl_frame_mix *images,
         require(images->timestamps[i] <= images->timestamps[i+1]);
 
     if (custom) {
-        require(custom->mix);
+        require(texture_mixer ? !!texture_mixer->mix : !!shader_mixer->mix);
         require(images->num_frames <= MAX_MIX_FRAMES);
         require(isfinite(images->vsync_duration));
         if ((!source && params->peak_detect_params) || params->force_low_bit_depth_fbos ||
@@ -5145,21 +5147,25 @@ inter_pass_error:
         pl_assert(fidx == images->num_frames && reference >= 0);
         struct pl_color_space color = target->color;
         color.transfer = PL_COLOR_TRC_LINEAR_HDR;
-        failure = "texture callback/output";
-        pl_tex mixed = custom->mix(custom->priv, &(struct pl_rendered_mix) {
+        struct pl_rendered_mix views = {
             .frames = rendered,
             .num_frames = fidx,
             .reference = reference,
             .color = color,
-        });
-        if (!mixed || !mixed->params.sampleable || mixed->params.w != out_w ||
-            mixed->params.h != out_h || mixed->params.d ||
-            mixed->params.format->type != PL_FMT_FLOAT ||
-            mixed->params.format->num_components != 4)
-            goto fallback;
-        for (int c = 0; c < 4; c++) {
-            if (mixed->params.format->component_depth[c] != 32)
+        };
+        pl_tex mixed = NULL;
+        failure = "texture callback/output";
+        if (texture_mixer) {
+            mixed = texture_mixer->mix(texture_mixer->priv, &views);
+            if (!mixed || !mixed->params.sampleable || mixed->params.w != out_w ||
+                mixed->params.h != out_h || mixed->params.d ||
+                mixed->params.format->type != PL_FMT_FLOAT ||
+                mixed->params.format->num_components != 4)
                 goto fallback;
+            for (int c = 0; c < 4; c++) {
+                if (mixed->params.format->component_depth[c] != 32)
+                    goto fallback;
+            }
         }
 
         // A source may supply overlays in acquire, and release may invalidate
@@ -5196,7 +5202,20 @@ inter_pass_error:
             goto fallback;
         }
         pl_shader sh = pl_dispatch_begin(rr->dp);
-        pl_shader_sample_direct(sh, pl_sample_src( .tex = mixed ));
+        failure = "shader callback/output";
+        if (shader_mixer) {
+            int shader_w, shader_h;
+            if (!shader_mixer->mix(shader_mixer->priv, &views, sh) ||
+                sh->input != PL_SHADER_SIG_NONE || sh->output != PL_SHADER_SIG_COLOR ||
+                (pl_shader_output_size(sh, &shader_w, &shader_h) &&
+                 (shader_w != out_w || shader_h != out_h))) {
+                pl_dispatch_abort(rr->dp, &sh);
+                pass_uninit(&output);
+                goto fallback;
+            }
+        } else {
+            pl_shader_sample_direct(sh, pl_sample_src( .tex = mixed ));
+        }
         output.img = (struct img) {
             .sh = sh,
             .w = out_w,
@@ -5372,7 +5391,7 @@ bool pl_render_image_mix(pl_renderer rr, const struct pl_frame_mix *images,
                          const struct pl_render_params *params)
 {
     rr->fallback_peak_owner = NULL;
-    bool ok = render_image_mix(rr, images, target, params, NULL, NULL);
+    bool ok = render_image_mix(rr, images, target, params, NULL, NULL, NULL);
     if (ok)
         rr->last_source_peak_valid = false;
     return ok;
@@ -5386,7 +5405,7 @@ bool pl_render_image_mix_custom(pl_renderer rr, const struct pl_frame_mix *image
     if (!mixer)
         return false;
     rr->fallback_peak_owner = NULL;
-    bool ok = render_image_mix(rr, images, target, params, mixer, NULL);
+    bool ok = render_image_mix(rr, images, target, params, mixer, NULL, NULL);
     if (ok)
         rr->last_source_peak_valid = false;
     return ok;
@@ -5506,7 +5525,22 @@ bool pl_render_image_mix_source(pl_renderer rr, const struct pl_frame_mix *image
         return source_render_empty(rr, target, params, source);
     if (!source_render_begin(rr, params, source, images->num_frames, images->frames))
         return false;
-    bool ok = render_image_mix(rr, images, target, params, mixer, source);
+    bool ok = render_image_mix(rr, images, target, params, mixer, source, NULL);
+    return source_render_finish(rr, source, ok);
+}
+
+bool pl_render_image_mix_source_shader(pl_renderer rr,
+                                       const struct pl_frame_mix *images,
+                                       const struct pl_frame *target,
+                                       const struct pl_render_params *params,
+                                       const struct pl_source_peak_context *source,
+                                       const struct pl_frame_shader_mixer *mixer)
+{
+    if (!images || images->num_frames < 1 || !mixer || !mixer->mix)
+        return false;
+    if (!source_render_begin(rr, params, source, images->num_frames, images->frames))
+        return false;
+    bool ok = render_image_mix(rr, images, target, params, NULL, source, mixer);
     return source_render_finish(rr, source, ok);
 }
 
