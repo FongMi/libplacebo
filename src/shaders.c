@@ -447,6 +447,93 @@ ident_t sh_const(pl_shader sh, struct pl_shader_const sc)
     pl_unreachable();
 }
 
+bool sh_can_snapshot(pl_shader sh)
+{
+    if (!sh || sh->failed || !sh->mutable || sh->opaque ||
+        sh->type != SH_AUTO || sh->transpose ||
+        sh->input != PL_SHADER_SIG_NONE || sh->output != PL_SHADER_SIG_COLOR)
+        return false;
+    for (int i = 0; i < sh->descs.num; i++) {
+        const struct pl_shader_desc *sd = &sh->descs.elem[i];
+        if (!sd->binding.object || sd->memory)
+            return false;
+        switch (sd->desc.type) {
+        case PL_DESC_SAMPLED_TEX:
+        case PL_DESC_BUF_UNIFORM:
+        case PL_DESC_BUF_TEXEL_UNIFORM:
+            break;
+        case PL_DESC_STORAGE_IMG:
+        case PL_DESC_BUF_STORAGE:
+        case PL_DESC_BUF_TEXEL_STORAGE:
+            if (sd->desc.access != PL_DESC_ACCESS_READONLY)
+                return false;
+            break;
+        default:
+            return false;
+        }
+    }
+    return true;
+}
+
+bool sh_snapshot(pl_shader src, pl_shader sh)
+{
+    if (!sh || sh == src || !sh_can_snapshot(src))
+        return false;
+    pl_shader_reset(sh, &SH_PARAMS(src));
+    sh->name = src->name;
+    sh->prefix = src->prefix;
+    sh->fresh = src->fresh;
+    sh->input = src->input;
+    sh->output = src->output;
+    sh->output_w = src->output_w;
+    sh->output_h = src->output_h;
+    sh->type = src->type;
+    sh->flexible_work_groups = src->flexible_work_groups;
+    memcpy(sh->group_size, src->group_size, sizeof(sh->group_size));
+    sh->shmem = src->shmem;
+    sh->sampler_type = src->sampler_type;
+    sh->sampler_prefix = src->sampler_prefix;
+    // Execute templates while their borrowed arguments still belong to src.
+    for (int i = 0; i < SH_BUF_COUNT; i++)
+        pl_str_builder_str(sh->buffers[i], pl_str_builder_exec(src->buffers[i]));
+    for (int i = 0; i < src->vars.num; i++) {
+        struct pl_shader_var v = src->vars.elem[i];
+        struct pl_var_layout layout = pl_var_host_layout(0, &v.var);
+        v.data = sh_memdup(sh, v.data, layout.size, layout.stride);
+        PL_ARRAY_APPEND(sh, sh->vars, v);
+    }
+    for (int i = 0; i < src->vas.num; i++) {
+        struct pl_shader_va v = src->vas.elem[i];
+        for (int k = 0; k < 4; k++)
+            v.data[k] = sh_memdup(sh, v.data[k], v.attr.fmt->texel_size,
+                                  v.attr.fmt->texel_size);
+        PL_ARRAY_APPEND(sh, sh->vas, v);
+    }
+    for (int i = 0; i < src->consts.num; i++) {
+        struct pl_shader_const v = src->consts.elem[i];
+        size_t size = pl_var_type_size(v.type);
+        v.data = sh_memdup(sh, v.data, size, size);
+        PL_ARRAY_APPEND(sh, sh->consts, v);
+    }
+    for (int i = 0; i < src->descs.num; i++) {
+        struct pl_shader_desc v = src->descs.elem[i];
+        size_t size = v.num_buffer_vars * sizeof(v.buffer_vars[0]);
+        if (size)
+            v.buffer_vars = sh_memdup(sh, v.buffer_vars, size,
+                                      alignof(struct pl_buffer_var));
+        PL_ARRAY_APPEND(sh, sh->descs, v);
+    }
+    for (int i = 0; i < src->obj.num; i++) {
+        pl_shader_obj obj = src->obj.elem[i];
+        pl_rc_ref(&obj->rc);
+        PL_ARRAY_APPEND(sh, sh->obj, obj);
+    }
+    for (int i = 0; i < src->info->steps.num; i++)
+        sh_describe(sh, pl_strdup0(sh->info->tmp,
+                                  pl_str0(src->info->steps.elem[i])));
+    return true;
+}
+
 ident_t sh_const_int(pl_shader sh, const char *name, int val)
 {
     return sh_const(sh, (struct pl_shader_const) {
@@ -715,6 +802,8 @@ ident_t sh_subpass(pl_shader sh, pl_shader sub)
     }
     pl_str_builder_concat(sh->buffers[SH_BUF_HEADER], sub->buffers[SH_BUF_BODY]);
     GLSLH("%s\n}\n\n", retvals[sub->output]);
+
+    sh->opaque |= sub->opaque;
 
     // Steal all inputs and objects from the subpass
 #define ARRAY_STEAL(arr) do                 \
@@ -993,6 +1082,7 @@ void *sh_alloc_obj(pl_gpu gpu, pl_shader_obj *ptr,
 
 ident_t sh_prng(pl_shader sh, bool temporal, ident_t *p_state)
 {
+    sh->opaque = true; // fragment coordinates can change between dispatches
     ident_t randfun = sh_fresh(sh, "rand"),
             state = sh_fresh(sh, "state");
 

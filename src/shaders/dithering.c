@@ -78,7 +78,8 @@ static inline float approx_gamma(enum pl_color_transfer trc)
 {
     switch (trc) {
     case PL_COLOR_TRC_UNKNOWN:  return 1.0f;
-    case PL_COLOR_TRC_LINEAR:   return 1.0f;
+    case PL_COLOR_TRC_LINEAR:
+    case PL_COLOR_TRC_LINEAR_HDR: return 1.0f;
     case PL_COLOR_TRC_SCRGB:    return 1.0f;
     case PL_COLOR_TRC_PRO_PHOTO:return 1.8f;
     case PL_COLOR_TRC_GAMMA18:  return 1.8f;
@@ -125,6 +126,7 @@ void sh_dither(pl_shader sh, int new_depth, float steps,
     if (!sh_require(sh, PL_SHADER_SIG_COLOR, 0, 0))
         return;
 
+    sh->opaque = true; // dithering depends on final fragment coordinates
     sh_describef(sh, "dithering (%d bits)", new_depth);
     GLSL("// pl_shader_dither \n"
         "{                    \n"

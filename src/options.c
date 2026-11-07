@@ -1440,7 +1440,8 @@ const struct pl_opt_t pl_color_space_opts[] = {
              {"v-log",       PL_COLOR_TRC_V_LOG},
              {"s-log1",      PL_COLOR_TRC_S_LOG1},
              {"s-log2",      PL_COLOR_TRC_S_LOG2},
-             {"scrgb",       PL_COLOR_TRC_SCRGB})),
+             {"scrgb",       PL_COLOR_TRC_SCRGB},
+             {"linear-hdr",  PL_COLOR_TRC_LINEAR_HDR})),
     OPT_STRUCT("hdr", "HDR metadata", hdr, pl_hdr_metadata_opts),
     {0},
 #undef STRUCT_BASE

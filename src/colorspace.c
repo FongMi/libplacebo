@@ -380,6 +380,7 @@ const char *const pl_color_transfer_names[PL_COLOR_TRC_COUNT] = {
     [PL_COLOR_TRC_S_LOG1]       = "Sony S-Log1",
     [PL_COLOR_TRC_S_LOG2]       = "Sony S-Log2",
     [PL_COLOR_TRC_SCRGB]        = "IEC 61966-2-2 scRGB (extended linear BT.709)",
+    [PL_COLOR_TRC_LINEAR_HDR]   = "Normalized absolute linear HDR",
 };
 
 const char *pl_color_transfer_name(enum pl_color_transfer trc)
@@ -407,8 +408,8 @@ float pl_color_transfer_nominal_peak(enum pl_color_transfer trc)
     case PL_COLOR_TRC_PRO_PHOTO:
     case PL_COLOR_TRC_ST428:
         return 1.0;
-    // scRGB has no nominal peak since it's a linear transfer function used with
-    // 16hf values. Define it to 10000 nits, same as PQ.
+    // Extended linear HDR has no encoding bound. Use PQ's nominal 10000 nits.
+    case PL_COLOR_TRC_LINEAR_HDR:
     case PL_COLOR_TRC_SCRGB:
     case PL_COLOR_TRC_PQ:       return 10000.0 / PL_COLOR_SDR_WHITE;
     case PL_COLOR_TRC_HLG:      return 12.0 / HLG_75;
@@ -419,6 +420,11 @@ float pl_color_transfer_nominal_peak(enum pl_color_transfer trc)
     }
 
     pl_unreachable();
+}
+
+bool pl_color_transfer_is_normalized_linear(enum pl_color_transfer trc)
+{
+    return trc == PL_COLOR_TRC_LINEAR || trc == PL_COLOR_TRC_LINEAR_HDR;
 }
 
 const struct pl_hdr_metadata pl_hdr_metadata_empty = {0};
@@ -610,6 +616,7 @@ bool pl_color_space_is_black_scaled(const struct pl_color_space *csp)
     case PL_COLOR_TRC_HLG:
         return true;
 
+    case PL_COLOR_TRC_LINEAR_HDR:
     case PL_COLOR_TRC_BT_1886:
     case PL_COLOR_TRC_PQ:
     case PL_COLOR_TRC_SCRGB:
@@ -635,7 +642,7 @@ bool pl_color_space_is_black_scaled(const struct pl_color_space *csp)
 
 void pl_color_linearize(const struct pl_color_space *csp, float color[3])
 {
-    if (csp->transfer == PL_COLOR_TRC_LINEAR)
+    if (pl_color_transfer_is_normalized_linear(csp->transfer))
         return;
 
     float csp_min, csp_max;
@@ -715,6 +722,7 @@ void pl_color_linearize(const struct pl_color_space *csp, float color[3])
         MAP3(X * (PL_COLOR_SCRGB_WHITE / PL_COLOR_SDR_WHITE));
         return;
     case PL_COLOR_TRC_LINEAR:
+    case PL_COLOR_TRC_LINEAR_HDR:
     case PL_COLOR_TRC_COUNT:
         break;
     }
@@ -728,7 +736,7 @@ scale_out:
 
 void pl_color_delinearize(const struct pl_color_space *csp, float color[3])
 {
-    if (csp->transfer == PL_COLOR_TRC_LINEAR)
+    if (pl_color_transfer_is_normalized_linear(csp->transfer))
         return;
 
     float csp_min, csp_max;
@@ -809,6 +817,7 @@ void pl_color_delinearize(const struct pl_color_space *csp, float color[3])
         MAP3(X * (PL_COLOR_SDR_WHITE / PL_COLOR_SCRGB_WHITE));
         return;
     case PL_COLOR_TRC_LINEAR:
+    case PL_COLOR_TRC_LINEAR_HDR:
     case PL_COLOR_TRC_COUNT:
         break;
     }
@@ -982,6 +991,7 @@ static void infer_both_ref(struct pl_color_space *space,
             space->transfer = ref->transfer;
             break;
         case PL_COLOR_TRC_PQ:
+        case PL_COLOR_TRC_LINEAR_HDR:
         case PL_COLOR_TRC_HLG:
         case PL_COLOR_TRC_V_LOG:
         case PL_COLOR_TRC_S_LOG1:
