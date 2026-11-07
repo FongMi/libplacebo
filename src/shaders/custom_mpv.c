@@ -1278,6 +1278,7 @@ static struct pl_hook_res hook_hook(void *priv, const struct pl_hook_params *par
 
         // Generate a new shader object
         sh = pl_dispatch_begin(params->dispatch);
+        sh->opaque = true;
 
         // Bind all necessary input textures
         for (int i = 0; i < PL_ARRAY_SIZE(hook->bind_tex); i++) {

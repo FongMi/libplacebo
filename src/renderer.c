@@ -30,6 +30,13 @@
 struct cached_frame {
     uint64_t signature;
     uint64_t params_hash; // for detecting `pl_render_params` changes
+    uint64_t content_id; // custom mixer rendered-pixel identity
+    uint64_t view_hash;
+    bool custom;
+    bool valid;
+    pl_source_peak_state peak_owner;
+    uint64_t peak_id;
+    struct pl_color_space view_color;
     struct pl_color_space color;
     struct pl_color_repr repr;
     struct pl_icc_profile profile;
@@ -38,6 +45,233 @@ struct cached_frame {
     int comps;
     bool evict; // for garbage collection
 };
+
+struct source_peak_record {
+    pl_source_peak_state owner;
+    uint64_t id, presentation_id;
+    uint64_t before_segment, after_segment;
+    enum pl_source_peak_status status;
+    pl_shader_obj measurement;
+    struct sh_peak_result sample, before, after, presentation;
+    bool measure, sample_ready, before_valid, after_valid;
+    bool latched, delayed, target_relative;
+};
+
+struct pl_source_peak_state_t {
+    pl_log log;
+    pl_gpu gpu;
+    pl_renderer measurement_rr;
+    uint64_t epoch, current_id, committed_id, next_presentation_id;
+    uint64_t history_segment, next_segment_id;
+    struct pl_peak_detect_params params;
+    struct sh_peak_result history;
+    PL_ARRAY(struct source_peak_record) frames;
+    bool initialized, enabled, active;
+};
+
+pl_source_peak_state pl_source_peak_state_create(pl_log log, pl_gpu gpu)
+{
+    if (!gpu)
+        return NULL;
+    pl_source_peak_state state = pl_alloc_ptr(NULL, state);
+    *state = (struct pl_source_peak_state_t) {.log = log, .gpu = gpu};
+    return state;
+}
+
+static void source_peak_clear(pl_source_peak_state state)
+{
+    for (int i = 0; i < state->frames.num; i++)
+        pl_shader_obj_destroy(&state->frames.elem[i].measurement);
+    state->frames.num = 0;
+    state->history = (struct sh_peak_result) {0};
+    state->history_segment = 0;
+    state->current_id = state->committed_id = 0;
+    if (state->measurement_rr)
+        pl_renderer_reset_errors(state->measurement_rr, NULL);
+}
+
+void pl_source_peak_state_destroy(pl_source_peak_state *pstate)
+{
+    pl_source_peak_state state = *pstate;
+    if (!state)
+        return;
+    if (state->active) {
+        PL_ERR(state, "Cannot destroy a source peak state during rendering!");
+        return;
+    }
+    source_peak_clear(state);
+    pl_renderer_destroy(&state->measurement_rr);
+    pl_free_ptr(pstate);
+}
+
+bool pl_source_peak_state_reset(pl_source_peak_state state, uint64_t epoch)
+{
+    if (!state || state->active)
+        return false;
+    source_peak_clear(state);
+    state->epoch = epoch;
+    state->initialized = false;
+    return true;
+}
+
+static struct source_peak_record *source_peak_find(pl_source_peak_state state,
+                                                   uint64_t id)
+{
+    for (int i = 0; i < state->frames.num; i++) {
+        if (state->frames.elem[i].id == id)
+            return &state->frames.elem[i];
+    }
+    return NULL;
+}
+
+static bool source_peak_after(pl_source_peak_state state,
+                               struct source_peak_record *record)
+{
+    if (record->after_valid)
+        return true;
+    if (record->status == PL_SOURCE_PEAK_ERROR)
+        return false;
+    pl_assert(record->before_valid);
+    if (record->status == PL_SOURCE_PEAK_UNSUPPORTED) {
+        record->after = (struct sh_peak_result) {0};
+        record->after_segment = record->before_segment;
+        if (!record->after_segment) {
+            pl_assert(state->next_segment_id < UINT64_MAX);
+            record->after_segment = ++state->next_segment_id;
+        }
+        record->after_valid = true;
+        return true;
+    }
+    if (record->measure && !record->sample_ready) {
+        enum sh_peak_status status = sh_get_peak_measurement(record->measurement,
+                                                             true, &record->sample);
+        if (status != SH_PEAK_READY) {
+            if (status == SH_PEAK_ERROR)
+                record->status = PL_SOURCE_PEAK_ERROR;
+            return false;
+        }
+        record->sample_ready = true;
+        record->status = PL_SOURCE_PEAK_READY;
+        pl_shader_obj_destroy(&record->measurement);
+    }
+    record->after = record->before;
+    record->after_segment = 0;
+    if (record->measure) {
+        sh_peak_smooth(&record->after, &record->sample, &state->params);
+    } else {
+        record->after = (struct sh_peak_result) {0};
+    }
+    record->after_valid = true;
+    return true;
+}
+
+static bool source_render_error(const struct pl_source_peak_context *source,
+                                const char *reason, uint64_t id)
+{
+    pl_source_peak_state state = source->state;
+    const struct source_peak_record *record = source_peak_find(state, id);
+    PL_ERR(state, "Source render failed: %s (id=%llu status=%d epoch=%llu/%llu "
+           "current=%llu/%llu committed=%llu retire=%llu first_view=%llu)", reason,
+           (unsigned long long) id, record ? (int) record->status : -1,
+           (unsigned long long) source->epoch, (unsigned long long) state->epoch,
+           (unsigned long long) source->current_id,
+           (unsigned long long) state->current_id,
+           (unsigned long long) state->committed_id,
+           (unsigned long long) source->retire_before_id,
+           (unsigned long long) (source->ids ? source->ids[0] : 0));
+    return false;
+}
+
+static bool source_peak_prepare(const struct pl_source_peak_context *source,
+                                 uint64_t id)
+{
+    pl_source_peak_state state = source->state;
+    if (!state->initialized || source->epoch != state->epoch ||
+        source->current_id < state->current_id || !source->current_id)
+        return source_render_error(source, "clock/epoch", source->current_id);
+
+    if (!id)
+        return source_render_error(source, "view ID order", id);
+    struct source_peak_record *view = source_peak_find(state, id);
+    if (!view || view->status == PL_SOURCE_PEAK_ERROR)
+        return source_render_error(source, "view record unavailable", id);
+
+    struct sh_peak_result prefix = state->history;
+    uint64_t segment = state->history_segment;
+    for (int i = 0; i < state->frames.num; i++) {
+        struct source_peak_record *record = &state->frames.elem[i];
+        if (record->id > id)
+            break;
+        if (record->id <= state->committed_id)
+            continue;
+        if (!record->before_valid) {
+            record->before = prefix;
+            record->before_segment = segment;
+            record->before_valid = true;
+        }
+        if (record->id < id || !state->params.allow_delayed ||
+            record->status == PL_SOURCE_PEAK_UNSUPPORTED)
+        {
+            if (!source_peak_after(state, record))
+                return source_render_error(source, "peak measurement", record->id);
+            prefix = record->after;
+            segment = record->after_segment;
+        }
+    }
+
+    if (!view->latched || view->delayed != state->params.allow_delayed) {
+        if (!view->before_valid ||
+            (!state->params.allow_delayed && !source_peak_after(state, view)))
+            return source_render_error(source, "presentation snapshot", view->id);
+        view->presentation = view->status == PL_SOURCE_PEAK_UNSUPPORTED
+            ? (struct sh_peak_result) {0}
+            : state->params.allow_delayed ? view->before : view->after;
+        view->delayed = state->params.allow_delayed;
+        view->latched = true;
+        pl_assert(state->next_presentation_id < UINT64_MAX);
+        view->presentation_id = ++state->next_presentation_id;
+    }
+    return true;
+}
+
+static void source_peak_commit(const struct pl_source_peak_context *source)
+{
+    pl_source_peak_state state = source->state;
+    for (int i = 0; i < state->frames.num; i++) {
+        struct source_peak_record *record = &state->frames.elem[i];
+        if (record->id >= source->current_id)
+            break;
+        if (record->id > state->committed_id) {
+            pl_assert(record->after_valid);
+            state->history = record->after;
+            state->history_segment = record->after_segment;
+            state->committed_id = record->id;
+        }
+    }
+    state->current_id = source->current_id;
+    for (int i = 0; i < state->frames.num; ) {
+        struct source_peak_record *record = &state->frames.elem[i];
+        if (record->id < source->retire_before_id &&
+            record->id <= state->committed_id)
+        {
+            pl_shader_obj_destroy(&record->measurement);
+            PL_ARRAY_REMOVE_AT(state->frames, i);
+        } else {
+            i++;
+        }
+    }
+}
+
+bool pl_source_peak_get_hdr_metadata(pl_source_peak_state state,
+                                     uint64_t epoch, uint64_t id,
+                                     struct pl_hdr_metadata *metadata)
+{
+    if (!state || !state->initialized || epoch != state->epoch || !metadata)
+        return false;
+    struct source_peak_record *record = source_peak_find(state, id);
+    return record && record->latched && sh_peak_metadata(&record->presentation,
+                                                         metadata);
+}
 
 struct sampler {
     pl_shader_obj upscaler_state;
@@ -68,6 +302,11 @@ struct pl_renderer_t {
 
     // Shader resource objects and intermediate textures (FBOs)
     pl_shader_obj tone_map_state;
+    pl_shader_obj source_map_state;
+    struct sh_peak_result last_source_peak;
+    bool last_source_peak_valid;
+    pl_source_peak_state fallback_peak_owner;
+    uint64_t fallback_peak_segment;
     pl_shader_obj dither_state;
     pl_shader_obj motion_state;
     pl_shader_obj grain_state[4];
@@ -88,6 +327,7 @@ struct pl_renderer_t {
     // Frame cache (for frame mixing / interpolation)
     PL_ARRAY(struct cached_frame) frames;
     PL_ARRAY(pl_tex) frame_fbos;
+    uint64_t rendered_id;
 
     // For debugging / logging purposes
     int prev_dither;
@@ -159,6 +399,9 @@ static void renderer_uninit(pl_renderer rr)
 
     // Free all shader resource objects
     pl_shader_obj_destroy(&rr->tone_map_state);
+    pl_shader_obj_destroy(&rr->source_map_state);
+    rr->last_source_peak_valid = false;
+    rr->fallback_peak_owner = NULL;
     pl_shader_obj_destroy(&rr->dither_state);
     pl_shader_obj_destroy(&rr->motion_state);
     for (int i = 0; i < PL_ARRAY_SIZE(rr->lut_state); i++)
@@ -230,6 +473,8 @@ void pl_renderer_flush_cache(pl_renderer rr)
 
     pl_reset_detected_peak(rr->tone_map_state);
     pl_motion_reset(rr->motion_state);
+    rr->last_source_peak_valid = false;
+    rr->fallback_peak_owner = NULL;
 }
 
 const struct pl_render_params pl_render_fast_params = { PL_RENDER_DEFAULTS };
@@ -372,6 +617,8 @@ struct pass_state {
     pl_renderer rr;
     const struct pl_render_params *params;
     struct pl_render_info info; // for info callback
+    struct source_peak_record *source_peak;
+    pl_shader_obj *color_map_state;
 
     // Represents the "current" image which we're in the process of rendering.
     // This is initially set by pass_read_image, and all of the subsequent
@@ -385,6 +632,7 @@ struct pass_state {
 
     // Integer version of `target.crop`. Semantically identical.
     pl_rect2d dst_rect;
+    struct pl_frame acquired_target; // before geometry/color normalization
 
     // Logical end-to-end rotation
     pl_rotation rotation;
@@ -408,6 +656,8 @@ struct pass_state {
     pl_fmt fbofmt[5];
     bool *fbos_used;
     bool need_peak_fbo; // need indirection for peak detection
+    bool custom_mixer; // draw reference overlays after custom frame mixing
+    bool borrowed_target; // subpasses do not release the outer pass's target
 
     // Map of acquired frames
     struct {
@@ -652,9 +902,11 @@ static struct sampler_info sample_src_info(struct pass_state *pass,
     }
 
     if (params->correct_subpixel_offsets) {
-        if (!info.dir_sep[0] && fabsf(src->rect.x0) > 1e-6f)
+        if (!info.dir_sep[0] &&
+            fabsf(src->rect.x0 - roundf(src->rect.x0)) > 1e-6f)
             info.dir_sep[0] = SAMPLER_UP;
-        if (!info.dir_sep[1] && fabsf(src->rect.y0) > 1e-6f)
+        if (!info.dir_sep[1] &&
+            fabsf(src->rect.y0 - roundf(src->rect.y0)) > 1e-6f)
             info.dir_sep[1] = SAMPLER_UP;
     }
 
@@ -729,6 +981,20 @@ static void dispatch_sampler(struct pass_state *pass, pl_shader sh,
     pl_shader_obj *lut = NULL;
     switch (info.dir) {
     case SAMPLER_NOOP:
+        // Plane sampling may also implement the main scaler via free sampling.
+        if (usage == SAMPLER_PLANE && !target_tex) {
+            const pl_rect2df rect = pass->ref_rect;
+            if (fabsf(pl_rect_w(rect)) != abs(pl_rect_w(pass->dst_rect)) ||
+                fabsf(pl_rect_h(rect)) != abs(pl_rect_h(pass->dst_rect)))
+                goto fallback;
+        }
+        // Preserve exact texel centers without hardware interpolation error.
+        if (src->rect.x0 == roundf(src->rect.x0) &&
+            src->rect.y0 == roundf(src->rect.y0))
+        {
+            pl_shader_sample_nearest(sh, src);
+            return;
+        }
         goto fallback;
     case SAMPLER_DOWN:
         lut = &sampler->downscaler_state;
@@ -1035,7 +1301,7 @@ static void draw_overlays(struct pass_state *pass, pl_tex fbo,
             pl_shader_color_map_ex(sh, &overlay_cmp, pl_color_map_args(
                 .src   = ol_color,
                 .dst   = color,
-                .state = &rr->tone_map_state,
+                .state = pass->color_map_state,
             ));
         } else {
             pl_shader_color_map_ex(sh, &osd_params, pl_color_map_args(ol.color, color));
@@ -1244,50 +1510,81 @@ hook_error:
     return ret;
 }
 
-static void hdr_update_peak(struct pass_state *pass)
+static bool unpremultiply_input(pl_shader sh, enum pl_color_transfer original,
+                                struct pl_color_space *color,
+                                struct pl_color_repr *repr)
 {
-    const struct pl_render_params *params = pass->params;
-    pl_renderer rr = pass->rr;
+    bool prelinearized = false;
+    if (pl_color_transfer_is_normalized_linear(color->transfer)) {
+        if (repr->alpha == PL_ALPHA_PREMULTIPLIED) {
+            // Premultiplication precedes scaling's transfer conversion.
+            color->transfer = original;
+            pl_shader_delinearize(sh, color);
+        } else {
+            prelinearized = true;
+        }
+    } else if (pl_color_transfer_is_normalized_linear(original)) {
+        pl_shader_linearize(sh, color);
+        color->transfer = PL_COLOR_TRC_LINEAR;
+    }
+    pl_shader_set_alpha(sh, repr, PL_ALPHA_INDEPENDENT);
+    return prelinearized;
+}
 
-    // Use pass->image than pass->img to deal with cases that input is HDR
-    // content but already linearized when scaling.
-    if (!params->peak_detect_params || !pl_color_space_is_hdr(&pass->image.color))
-        goto cleanup;
-
-    if (rr->errors & PL_RENDER_ERR_PEAK_DETECT)
-        goto cleanup;
-
-    if (pass->fbofmt[4] && !(pass->fbofmt[4]->caps & PL_FMT_CAP_STORABLE))
-        goto cleanup;
-
-    if (!rr->gpu->limits.max_ssbo_size)
-        goto cleanup;
-
-    float max_peak = pl_color_transfer_nominal_peak(pass->image.color.transfer) *
+static bool view_needs_peak(const struct pl_color_space *color,
+                             const struct pl_hdr_metadata *hdr,
+                             const struct pl_color_space *target,
+                             const struct pl_render_params *params)
+{
+    if (!params->peak_detect_params || !pl_color_space_is_hdr(color))
+        return false;
+    float max_peak = pl_color_transfer_nominal_peak(color->transfer) *
                      PL_COLOR_SDR_WHITE;
-    if (pass->image.color.transfer == PL_COLOR_TRC_HLG)
-        max_peak = pass->img.color.hdr.max_luma;
-    if (max_peak <= pass->target.color.hdr.max_luma + 1e-6)
-        goto cleanup; // no adaptation needed
+    if (color->transfer == PL_COLOR_TRC_HLG)
+        max_peak = hdr->max_luma;
+    // Linear HDR has no encoding bound. Its nominal white is not a peak.
+    if (!pl_color_transfer_is_normalized_linear(color->transfer) &&
+        max_peak <= target->hdr.max_luma + 1e-6)
+        return false; // no adaptation needed
 
-    if (pl_hdr_metadata_contains(&pass->img.color.hdr, PL_HDR_METADATA_HDR10PLUS) &&
-        pl_hdr_metadata_contains(&pass->img.color.hdr, PL_HDR_METADATA_CIE_Y))
-        goto cleanup; // metadata already present
+    if (pl_hdr_metadata_contains(hdr, PL_HDR_METADATA_HDR10PLUS) &&
+        pl_hdr_metadata_contains(hdr, PL_HDR_METADATA_CIE_Y))
+        return false; // metadata already present
 
     enum pl_hdr_metadata_type metadata = PL_HDR_METADATA_ANY;
     if (params->color_map_params)
         metadata = params->color_map_params->metadata;
 
     if (metadata && metadata != PL_HDR_METADATA_CIE_Y)
-        goto cleanup; // metadata will be unused
+        return false; // metadata will be unused
 
     const struct pl_color_map_params *cpars = params->color_map_params;
     bool uses_ootf = cpars && cpars->tone_mapping_function == &pl_tone_map_st2094_40;
-    if (uses_ootf && pass->img.color.hdr.ootf.num_anchors)
-        goto cleanup; // HDR10+ OOTF is being used
+    if (uses_ootf && hdr->ootf.num_anchors)
+        return false; // HDR10+ OOTF is being used
 
     if (params->lut && params->lut_type == PL_LUT_CONVERSION)
-        goto cleanup; // LUT handles tone mapping
+        return false; // LUT handles tone mapping
+
+    return true;
+}
+
+static void hdr_update_peak(struct pass_state *pass)
+{
+    const struct pl_render_params *params = pass->params;
+    pl_renderer rr = pass->rr;
+    if (pass->source_peak &&
+        pass->source_peak->status != PL_SOURCE_PEAK_UNSUPPORTED)
+        return; // source-time measurement and presentation are already selected
+    if (!view_needs_peak(&pass->image.color, &pass->img.color.hdr,
+                          &pass->target.color, params))
+        goto cleanup;
+    if (rr->errors & PL_RENDER_ERR_PEAK_DETECT)
+        goto cleanup;
+    if (pass->fbofmt[4] && !(pass->fbofmt[4]->caps & PL_FMT_CAP_STORABLE))
+        goto cleanup;
+    if (!rr->gpu->limits.max_ssbo_size)
+        goto cleanup;
 
     if (!pass->fbofmt[4] && !params->peak_detect_params->allow_delayed) {
         PL_WARN(rr, "Disabling peak detection because "
@@ -1297,8 +1594,43 @@ static void hdr_update_peak(struct pass_state *pass)
         goto cleanup;
     }
 
-    bool ok = pl_shader_detect_peak(img_sh(pass, &pass->img), pass->img.color,
-                                    &rr->tone_map_state, params->peak_detect_params);
+    pl_shader sh = img_sh(pass, &pass->img);
+    if (!params->peak_detect_params->allow_delayed && sh_can_snapshot(sh)) {
+        pl_shader measurement = pl_dispatch_begin(rr->dp);
+        if (!sh_snapshot(sh, measurement)) {
+            pl_dispatch_abort(rr->dp, &measurement);
+            PL_WARN(rr, "Failed snapshotting HDR peak detection shader.. disabling");
+            rr->errors |= PL_RENDER_ERR_PEAK_DETECT;
+            goto cleanup;
+        }
+        struct pl_color_space color = pass->img.color;
+        struct pl_color_repr repr = pass->img.repr;
+        unpremultiply_input(measurement, pass->image.color.transfer, &color, &repr);
+        bool ok = pl_shader_detect_peak(measurement, color, &rr->tone_map_state,
+                                        params->peak_detect_params);
+        if (ok) {
+            ok = pl_dispatch_compute(rr->dp, pl_dispatch_compute_params(
+                .shader = &measurement,
+                .width = pass->img.w,
+                .height = pass->img.h));
+        }
+        pl_dispatch_abort(rr->dp, &measurement);
+        if (!ok) {
+            PL_WARN(rr, "Failed dispatching HDR peak detection shader.. disabling");
+            rr->errors |= PL_RENDER_ERR_PEAK_DETECT;
+            goto cleanup;
+        }
+        pass->need_peak_fbo = false;
+        return;
+    }
+    ident_t original = sh_fresh(sh, "peak_color");
+    GLSL("vec4 "$" = color; \n", original);
+    struct pl_color_space color = pass->img.color;
+    struct pl_color_repr repr = pass->img.repr;
+    unpremultiply_input(sh, pass->image.color.transfer, &color, &repr);
+    bool ok = pl_shader_detect_peak(sh, color, &rr->tone_map_state,
+                                    params->peak_detect_params);
+    GLSL("color = "$"; \n", original);
     if (!ok) {
         PL_WARN(rr, "Failed creating HDR peak detection shader.. disabling");
         rr->errors |= PL_RENDER_ERR_PEAK_DETECT;
@@ -1317,6 +1649,8 @@ cleanup:
 bool pl_renderer_get_hdr_metadata(pl_renderer rr,
                                   struct pl_hdr_metadata *metadata)
 {
+    if (rr->last_source_peak_valid)
+        return sh_peak_metadata(&rr->last_source_peak, metadata);
     return pl_get_detected_hdr_metadata(rr->tone_map_state, metadata);
 }
 
@@ -1617,6 +1951,16 @@ static bool want_merge(struct pass_state *pass,
 }
 
 static int frame_ref(const struct pl_frame *frame);
+
+static bool frame_needs_dovi_el(const struct pl_frame *image)
+{
+#ifdef PL_HAVE_DOVI
+    return image->repr.sys == PL_COLOR_SYSTEM_DOLBYVISION &&
+           image->repr.dovi && image->repr.dovi->nlq_active;
+#else
+    return false;
+#endif
+}
 
 #ifdef PL_HAVE_DOVI
 // Build a sub-shader that samples the enhancement layer planes and returns
@@ -2230,7 +2574,10 @@ static bool pass_scale_main(struct pass_state *pass)
         goto done;
     }
 
-    if (info.type == SAMPLER_DIRECT && !need_fbo) {
+    if (info.type == SAMPLER_DIRECT && !need_fbo &&
+        src.rect.x0 == 0.0f && src.rect.y0 == 0.0f &&
+        src.rect.x1 == img->w && src.rect.y1 == img->h)
+    {
         img->w = src.new_w;
         img->h = src.new_h;
         img->rect = new_rect;
@@ -2249,9 +2596,11 @@ static bool pass_scale_main(struct pass_state *pass)
             use_linear = false; // linear HDR needs out-of-range signals
     }
 
-    if (!(use_linear || use_sigmoid) && img->color.transfer == PL_COLOR_TRC_LINEAR) {
+    if (!(use_linear || use_sigmoid) &&
+        pl_color_transfer_is_normalized_linear(img->color.transfer))
+    {
         img->color.transfer = image->color.transfer;
-        if (image->color.transfer == PL_COLOR_TRC_LINEAR)
+        if (pl_color_transfer_is_normalized_linear(image->color.transfer))
             img->color.transfer = PL_COLOR_TRC_GAMMA22; // arbitrary fallback
         pl_shader_delinearize(img_sh(pass, img), &img->color);
     }
@@ -2314,8 +2663,11 @@ static pl_tex get_feature_map(struct pass_state *pass)
         return NULL; // LUT handles tone mapping
 
     struct img *img = &pass->img;
-    if (!img_tex(pass, img))
+    bool snapshot = sh_can_snapshot(img->sh);
+    if (!snapshot && !img_tex(pass, img))
         return NULL;
+
+    pl_shader sh = NULL;
 
     const float ratio = cparams->contrast_smoothness;
     const int cr_w = ceilf(abs(pl_rect_w(pass->dst_rect)) / ratio);
@@ -2325,8 +2677,13 @@ static pl_tex get_feature_map(struct pass_state *pass)
     if (!inter_tex || !out_tex)
         goto error;
 
-    pl_shader sh = pl_dispatch_begin(rr->dp);
-    pl_shader_sample_direct(sh, pl_sample_src( .tex = img->tex ));
+    sh = pl_dispatch_begin(rr->dp);
+    if (snapshot) {
+        if (!sh_snapshot(img->sh, sh))
+            goto error;
+    } else {
+        pl_shader_sample_direct(sh, pl_sample_src( .tex = img->tex ));
+    }
     pl_shader_extract_features(sh, img->color);
     bool ok = pl_dispatch_finish(rr->dp, pl_dispatch_params(
         .shader = &sh,
@@ -2356,6 +2713,7 @@ static pl_tex get_feature_map(struct pass_state *pass)
     return out_tex;
 
 error:
+    pl_dispatch_abort(rr->dp, &sh);
     PL_ERR(rr, "Failed extracting luma for contrast recovery, disabling");
     rr->errors |= PL_RENDER_ERR_CONTRAST_RECOVERY;
     return NULL;
@@ -2373,7 +2731,7 @@ static bool target_encodes_linear_xyz(const struct pl_frame *target)
 }
 
 // Transforms image into the output color space (tone-mapping, ICC 3DLUT, etc)
-static void pass_convert_colors(struct pass_state *pass)
+static void pass_convert_colors(struct pass_state *pass, bool linear_output)
 {
     const struct pl_render_params *params = pass->params;
     const struct pl_frame *image = &pass->image;
@@ -2383,32 +2741,11 @@ static void pass_convert_colors(struct pass_state *pass)
     struct img *img = &pass->img;
     pl_shader sh = img_sh(pass, img);
 
-    bool prelinearized = false;
     bool need_conversion = true;
     assert(image->color.primaries == img->color.primaries);
-    if (img->color.transfer == PL_COLOR_TRC_LINEAR) {
-        if (img->repr.alpha == PL_ALPHA_PREMULTIPLIED) {
-            // Very annoying edge case: since prelinerization happens with
-            // premultiplied alpha, but color mapping happens with independent
-            // alpha, we need to go back to non-linear representation *before*
-            // alpha mode conversion, to avoid distortion
-            img->color.transfer = image->color.transfer;
-            pl_shader_delinearize(sh, &img->color);
-        } else {
-            prelinearized = true;
-        }
-    } else if (img->color.transfer != image->color.transfer) {
-        if (image->color.transfer == PL_COLOR_TRC_LINEAR) {
-            // Another annoying edge case: if the input is linear light, but we
-            // decide to un-linearize it for scaling purposes, we need to
-            // re-linearize before passing it into `pl_shader_color_map`
-            pl_shader_linearize(sh, &img->color);
-            img->color.transfer = PL_COLOR_TRC_LINEAR;
-        }
-    }
-
     // Do all processing in independent alpha, to avoid nonlinear distortions
-    pl_shader_set_alpha(sh, &img->repr, PL_ALPHA_INDEPENDENT);
+    bool prelinearized = unpremultiply_input(sh, image->color.transfer,
+                                             &img->color, &img->repr);
 
     // Apply color blindness simulation if requested
     if (params->cone_params)
@@ -2476,16 +2813,20 @@ static void pass_convert_colors(struct pass_state *pass)
 
         // generate HDR feature map if required
         pl_tex feature_map = get_feature_map(pass);
-        sh = img_sh(pass, img); // `get_feature_map` dispatches previous shader
+        sh = img_sh(pass, img); // `get_feature_map` may dispatch the previous shader
 
         // current -> target
-        pl_shader_color_map_ex(sh, params->color_map_params, pl_color_map_args(
+        struct pl_color_map_args mapping = {
             .src           = image->color,
             .dst           = target_csp,
             .prelinearized = prelinearized,
-            .state         = &rr->tone_map_state,
+            .state         = pass->color_map_state,
             .feature_map   = feature_map,
-        ));
+        };
+        if (linear_output)
+            sh_color_map_to_linear(sh, params->color_map_params, &mapping);
+        else
+            pl_shader_color_map_ex(sh, params->color_map_params, &mapping);
 
         if (target->icc)
             pl_icc_encode(sh, target->icc, &rr->icc_state[ICC_TARGET]);
@@ -2498,6 +2839,8 @@ static void pass_convert_colors(struct pass_state *pass)
     img->color = target->color;
     if (linear_xyz)
         img->color.transfer = PL_COLOR_TRC_LINEAR;
+    else if (linear_output)
+        img->color.transfer = PL_COLOR_TRC_LINEAR_HDR;
 }
 
 // Returns true if error diffusion was successfully performed
@@ -3021,7 +3364,7 @@ static bool pass_output_target(struct pass_state *pass)
     enum pl_lut_type lut_type = guess_frame_lut_type(target, true);
     if (lut_type != PL_LUT_CONVERSION) {
         if (repr.sys == PL_COLOR_SYSTEM_XYZ &&
-            img->color.transfer != PL_COLOR_TRC_LINEAR)
+            !pl_color_transfer_is_normalized_linear(img->color.transfer))
         {
             // XYZ is encoded in linear light
             pl_shader_linearize(sh, &img->color);
@@ -3225,7 +3568,7 @@ static bool pass_output_target(struct pass_state *pass)
         if (!ok)
             return false;
 
-        if (pass->info.stage != PL_RENDER_STAGE_BLEND) {
+        if (pass->info.stage != PL_RENDER_STAGE_BLEND || pass->custom_mixer) {
             draw_overlays(pass, plane->texture, plane->components,
                           plane->component_mapping, image->overlays,
                           image->num_overlays, target->color, target->repr,
@@ -3290,13 +3633,15 @@ static bool validate_structs(pl_renderer rr,
 {
     // Rendering to/from a frame with no planes is technically allowed, but so
     // pointless that it's more likely to be a user error worth catching.
-    require(target->num_planes > 0 && target->num_planes <= PL_MAX_PLANES);
-    for (int i = 0; i < target->num_planes; i++)
-        validate_plane(target->planes[i], renderable);
-    require(!pl_rect_w(target->crop) == !pl_rect_h(target->crop));
-    require(target->num_overlays >= 0);
-    for (int i = 0; i < target->num_overlays; i++)
-        validate_overlay(target->overlays[i]);
+    if (target) {
+        require(target->num_planes > 0 && target->num_planes <= PL_MAX_PLANES);
+        for (int i = 0; i < target->num_planes; i++)
+            validate_plane(target->planes[i], renderable);
+        require(!pl_rect_w(target->crop) == !pl_rect_h(target->crop));
+        require(target->num_overlays >= 0);
+        for (int i = 0; i < target->num_overlays; i++)
+            validate_overlay(target->overlays[i]);
+    }
 
     if (!image)
         return true;
@@ -3444,7 +3789,7 @@ static void fix_refs_and_rects(struct pass_state *pass)
 // display. See `pl_color_repr_decode_params.primaries`.
 static void infer_xyz_color(struct pl_color_space *color)
 {
-    if (color->transfer == PL_COLOR_TRC_LINEAR) {
+    if (pl_color_transfer_is_normalized_linear(color->transfer)) {
         // Linear light XYZ (e.g. scene-referred camera data) is D65-referenced
         // by convention. Honor explicitly tagged primaries, and otherwise
         // default to a wide D65 gamut, to avoid needlessly limiting the
@@ -3469,6 +3814,12 @@ static void fix_frame(struct pl_frame *frame)
 
     if (frame->repr.sys == PL_COLOR_SYSTEM_XYZ)
         infer_xyz_color(&frame->color);
+    else if (frame->repr.sys == PL_COLOR_SYSTEM_DOLBYVISION) {
+        // RPU decoding always produces BT.2020-referred PQ RGB, independently
+        // of the container's color tags.
+        frame->color.primaries = PL_COLOR_PRIM_BT_2020;
+        frame->color.transfer = PL_COLOR_TRC_PQ;
+    }
 
     // If the primaries are not known, guess them based on the resolution
     if (tex && !frame->color.primaries)
@@ -3531,7 +3882,8 @@ static void pass_uninit(struct pass_state *pass)
     release_frame(pass, &pass->next, &pass->acquired.next);
     release_frame(pass, &pass->prev, &pass->acquired.prev);
     release_frame(pass, &pass->image, &pass->acquired.image);
-    release_frame(pass, &pass->target, &pass->acquired.target);
+    if (!pass->borrowed_target)
+        release_frame(pass, &pass->target, &pass->acquired.target);
     pl_free_ptr(&pass->tmp);
 }
 
@@ -3624,6 +3976,50 @@ void pl_frames_infer(pl_renderer rr, struct pl_frame *image,
     *target = pass.target;
 }
 
+static bool acquire_source_frames(struct pass_state *pass)
+{
+    struct pl_frame *image = &pass->image;
+
+    if (!acquire_frame(pass, image, &pass->acquired.image))
+        return false;
+
+    // Custom output uses prepared pixels, even if acquire supplied references.
+    if (pass->custom_mixer)
+        image->prev = image->next = NULL;
+
+    const struct pl_render_params *params = pass->params;
+    const struct pl_deinterlace_params *deint = params->deinterlace_params;
+    bool needs_refs = image->field != PL_FIELD_NONE && deint &&
+                      pl_deinterlace_needs_refs(deint->algo);
+
+    if (image->prev && needs_refs) {
+        // Move into local copy so we can acquire/release it
+        pass->prev = *image->prev;
+        image->prev = &pass->prev;
+        if (!acquire_frame(pass, &pass->prev, &pass->acquired.prev))
+            return false;
+    }
+    if (image->next && needs_refs) {
+        pass->next = *image->next;
+        image->next = &pass->next;
+        if (!acquire_frame(pass, &pass->next, &pass->acquired.next))
+            return false;
+    }
+    if (image->enhancement_layer) {
+        if (frame_needs_dovi_el(image)) {
+            pass->enhancement_layer = *image->enhancement_layer;
+            image->enhancement_layer = &pass->enhancement_layer;
+            if (!acquire_frame(pass, &pass->enhancement_layer,
+                               &pass->acquired.enhancement_layer))
+                return false;
+        } else {
+            // EL was attached but won't be composed, drop it.
+            image->enhancement_layer = NULL;
+        }
+    }
+    return true;
+}
+
 static bool pass_init(struct pass_state *pass, bool acquire_image)
 {
     struct pl_frame *image = pass->src_ref < 0 ? NULL : &pass->image;
@@ -3631,46 +4027,9 @@ static bool pass_init(struct pass_state *pass, bool acquire_image)
 
     if (!acquire_frame(pass, target, &pass->acquired.target))
         goto error;
-    if (acquire_image && image) {
-        if (!acquire_frame(pass, image, &pass->acquired.image))
-            goto error;
-
-        const struct pl_render_params *params = pass->params;
-        const struct pl_deinterlace_params *deint = params->deinterlace_params;
-        bool needs_refs = image->field != PL_FIELD_NONE && deint &&
-                          pl_deinterlace_needs_refs(deint->algo);
-
-        if (image->prev && needs_refs) {
-            // Move into local copy so we can acquire/release it
-            pass->prev = *image->prev;
-            image->prev = &pass->prev;
-            if (!acquire_frame(pass, &pass->prev, &pass->acquired.prev))
-                goto error;
-        }
-        if (image->next && needs_refs) {
-            pass->next = *image->next;
-            image->next = &pass->next;
-            if (!acquire_frame(pass, &pass->next, &pass->acquired.next))
-                goto error;
-        }
-        if (image->enhancement_layer) {
-            bool acquire_el = false;
-#ifdef PL_HAVE_DOVI
-            acquire_el = image->repr.sys == PL_COLOR_SYSTEM_DOLBYVISION &&
-                         image->repr.dovi && image->repr.dovi->nlq_active;
-#endif
-            if (acquire_el) {
-                pass->enhancement_layer = *image->enhancement_layer;
-                image->enhancement_layer = &pass->enhancement_layer;
-                if (!acquire_frame(pass, &pass->enhancement_layer,
-                                   &pass->acquired.enhancement_layer))
-                    goto error;
-            } else {
-                // EL was attached but won't be composed, drop it.
-                image->enhancement_layer = NULL;
-            }
-        }
-    }
+    pass->acquired_target = *target;
+    if (acquire_image && image && !acquire_source_frames(pass))
+        goto error;
 
     if (!validate_structs(pass->rr, acquire_image ? image : NULL, target))
         goto error;
@@ -3686,10 +4045,31 @@ error:
     return false;
 }
 
-static void pass_begin_frame(struct pass_state *pass)
+static bool pass_begin_frame(struct pass_state *pass)
 {
     pl_renderer rr = pass->rr;
     const struct pl_render_params *params = pass->params;
+
+    struct source_peak_record *peak = pass->source_peak;
+    bool source_peak = peak && peak->status != PL_SOURCE_PEAK_UNSUPPORTED;
+    pass->color_map_state = source_peak ? &rr->source_map_state : &rr->tone_map_state;
+    if (peak && !source_peak) {
+        pl_assert(peak->after_segment);
+        if (rr->fallback_peak_owner != peak->owner ||
+            rr->fallback_peak_segment != peak->after_segment)
+        {
+            pl_reset_detected_peak(rr->tone_map_state);
+            rr->fallback_peak_owner = peak->owner;
+            rr->fallback_peak_segment = peak->after_segment;
+        }
+    }
+    if (source_peak) {
+        bool needs_peak = view_needs_peak(&pass->image.color, &pass->image.color.hdr,
+                                          &pass->target.color, params);
+        if (!sh_color_map_set_peak(rr->gpu, pass->color_map_state,
+            needs_peak ? &peak->presentation : NULL))
+            return false;
+    }
 
     pl_dispatch_callback(rr->dp, pass, info_callback);
     pl_dispatch_reset_frame(rr->dp);
@@ -3702,6 +4082,158 @@ static void pass_begin_frame(struct pass_state *pass)
     size_t size = rr->fbos[pass->info.stage].num * sizeof(bool);
     pass->fbos_used = pl_realloc(pass->tmp, pass->fbos_used, size);
     memset(pass->fbos_used, 0, size);
+    return true;
+}
+
+// Initialize only the native-source prefix, without a synthetic render target
+// or any display inference. Crop and colorspace remain source descriptions.
+static bool pass_init_source(struct pass_state *pass)
+{
+    struct pl_frame *image = &pass->image;
+    if (!acquire_source_frames(pass) || !validate_structs(pass->rr, image, NULL))
+        goto error;
+    pass->src_ref = frame_ref(image);
+    icc_fallback(pass, image, &pass->rr->icc_fallback[ICC_IMAGE]);
+    if (image->icc) {
+        image->color.primaries = image->icc->containing_primaries;
+        image->color.hdr = image->icc->csp.hdr;
+        if (image->icc->csp.transfer)
+            image->color.transfer = image->icc->csp.transfer;
+    }
+    fix_frame(image);
+    pl_color_space_infer(&image->color);
+    if (image->repr.alpha == PL_ALPHA_UNKNOWN)
+        image->repr.alpha = PL_ALPHA_INDEPENDENT;
+    pl_tex ref = image->planes[pass->src_ref].texture;
+    if (!pl_rect_w(image->crop) || !pl_rect_h(image->crop))
+        image->crop = (pl_rect2df) {0, 0, ref->params.w, ref->params.h};
+    pl_rect2df_normalize(&image->crop);
+    pass->ref_rect = image->crop;
+    pass->dst_rect = (pl_rect2d) {
+        0, 0, roundf(pl_rect_w(image->crop)), roundf(pl_rect_h(image->crop)),
+    };
+    find_fbo_format(pass);
+    pass->tmp = pl_tmp(NULL);
+    return true;
+
+error:
+    pass_uninit(pass);
+    return false;
+}
+
+static enum pl_source_peak_status source_peak_submit(
+    pl_source_peak_state state, uint64_t epoch, uint64_t id,
+    const struct pl_frame *source, const struct pl_peak_detect_params *params)
+{
+    bool enabled = !!params;
+    if (!state->initialized || state->epoch != epoch || state->enabled != enabled ||
+        (enabled && !sh_peak_params_equal(&state->params, params)))
+    {
+        source_peak_clear(state);
+        state->epoch = epoch;
+        state->enabled = enabled;
+        state->initialized = true;
+    }
+    state->params = params ? *params : (struct pl_peak_detect_params) {0};
+    struct source_peak_record *record = source_peak_find(state, id);
+    if (record)
+        return record->status;
+    if (id < state->current_id)
+        return PL_SOURCE_PEAK_ERROR; // late insertion needs an explicit epoch
+
+    int index = 0;
+    while (index < state->frames.num && state->frames.elem[index].id < id)
+        index++;
+    PL_ARRAY_INSERT_AT(state, state->frames, index,
+        (struct source_peak_record) {
+            .owner = state, .id = id, .status = PL_SOURCE_PEAK_ERROR,
+        });
+    record = &state->frames.elem[index];
+    // A newly discovered predecessor changes only not-yet-presented prefixes.
+    for (int i = index + 1; i < state->frames.num; i++) {
+        struct source_peak_record *future = &state->frames.elem[i];
+        future->before_valid = future->after_valid = future->latched = false;
+    }
+    if (!enabled) {
+        record->status = PL_SOURCE_PEAK_READY;
+        return record->status;
+    }
+
+    // Source decoding has independent error/sampler/grain state. A failed
+    // display scaler or overlay must not change the source estimator.
+    if (!state->measurement_rr)
+        state->measurement_rr = pl_renderer_create(state->log, state->gpu);
+    if (!state->measurement_rr)
+        return record->status;
+    pl_renderer measure_rr = state->measurement_rr;
+
+    struct pass_state pass = {
+        .rr = measure_rr,
+        .params = &pl_render_fast_params,
+        .image = *source,
+        .info.stage = PL_RENDER_STAGE_FRAME,
+    };
+    if (!pass_init_source(&pass))
+        return record->status;
+    if (pass.image.profile.len && !pass.image.icc) {
+        record->status = PL_SOURCE_PEAK_UNSUPPORTED;
+        goto done;
+    }
+    if (pass.image.field != PL_FIELD_NONE && frame_needs_dovi_el(&pass.image)) {
+        record->status = PL_SOURCE_PEAK_UNSUPPORTED;
+        goto done;
+    }
+    if (pass.image.color.transfer == PL_COLOR_TRC_HLG) {
+        // HLG uses the output peak when rendered to HDR. A native source
+        // measurement cannot describe that display-relative conversion.
+        record->target_relative = true;
+        record->status = PL_SOURCE_PEAK_UNSUPPORTED;
+        goto done;
+    }
+    if (!pl_color_space_is_hdr(&pass.image.color)) {
+        record->status = PL_SOURCE_PEAK_READY;
+        goto done;
+    }
+    // Native planes contain both fields. Measure the decoded samples once,
+    // without deinterlacing or acquiring neighboring pictures.
+    if (!pass_begin_frame(&pass) || !pass_read_image(&pass))
+        goto done;
+    if (measure_rr->errors & (PL_RENDER_ERR_FBO | PL_RENDER_ERR_SAMPLING |
+                              PL_RENDER_ERR_FILM_GRAIN | PL_RENDER_ERR_DEINTERLACING))
+        goto done;
+    pl_shader sh = img_sh(&pass, &pass.img);
+    struct pl_color_space color = pass.img.color;
+    struct pl_color_repr repr = pass.img.repr;
+    unpremultiply_input(sh, pass.image.color.transfer, &color, &repr);
+    if (!sh_measure_peak(sh, color, &record->measurement, params)) {
+        record->status = sh->failed ? PL_SOURCE_PEAK_ERROR : PL_SOURCE_PEAK_UNSUPPORTED;
+        goto done;
+    }
+    if (!pl_dispatch_compute(measure_rr->dp, pl_dispatch_compute_params(
+        .shader = &pass.img.sh,
+        .width = pass.img.w,
+        .height = pass.img.h)))
+        goto done;
+    record->measure = true;
+    record->status = PL_SOURCE_PEAK_PENDING;
+
+done:
+    pass_uninit(&pass);
+    return record->status;
+}
+
+enum pl_source_peak_status pl_source_peak_submit(
+    pl_renderer rr, pl_source_peak_state state, uint64_t epoch, uint64_t id,
+    const struct pl_frame *source, const struct pl_peak_detect_params *params)
+{
+    if (!rr || !state || (params && !source) || !id ||
+        state->gpu != rr->gpu || state->active)
+        return PL_SOURCE_PEAK_ERROR;
+    state->active = true;
+    enum pl_source_peak_status status = source_peak_submit(state, epoch, id,
+                                                          source, params);
+    state->active = false;
+    return status;
 }
 
 static bool draw_empty_overlays(pl_renderer rr,
@@ -3724,7 +4256,10 @@ static bool draw_empty_overlays(pl_renderer rr,
     if (!ptarget->num_overlays)
         goto done;
 
-    pass_begin_frame(&pass);
+    if (!pass_begin_frame(&pass)) {
+        pass_uninit(&pass);
+        return false;
+    }
     struct pl_frame *target = &pass.target;
     pl_tex ref = target->planes[pass.dst_ref].texture;
     for (int p = 0; p < target->num_planes; p++) {
@@ -3778,9 +4313,10 @@ fix_params(struct pl_render_params *out, const struct pl_render_params *params)
     return out;
 }
 
-bool pl_render_image(pl_renderer rr, const struct pl_frame *pimage,
-                     const struct pl_frame *ptarget,
-                     const struct pl_render_params *params)
+static bool render_image(pl_renderer rr, const struct pl_frame *pimage,
+                          const struct pl_frame *ptarget,
+                          const struct pl_render_params *params,
+                          struct source_peak_record *source_peak)
 {
     struct pl_render_params fixed;
     params = fix_params(&fixed, params);
@@ -3794,6 +4330,7 @@ bool pl_render_image(pl_renderer rr, const struct pl_frame *pimage,
         .image = *pimage,
         .target = *ptarget,
         .info.stage = PL_RENDER_STAGE_FRAME,
+        .source_peak = source_peak,
     };
 
     if (!pass_init(&pass, true))
@@ -3805,12 +4342,13 @@ bool pl_render_image(pl_renderer rr, const struct pl_frame *pimage,
         return draw_empty_overlays(rr, ptarget, params);
     }
 
-    pass_begin_frame(&pass);
+    if (!pass_begin_frame(&pass))
+        goto error;
     if (!pass_read_image(&pass))
         goto error;
     if (!pass_scale_main(&pass))
         goto error;
-    pass_convert_colors(&pass);
+    pass_convert_colors(&pass, false);
     if (!pass_output_target(&pass))
         goto error;
 
@@ -3821,6 +4359,17 @@ error:
     PL_ERR(rr, "Failed rendering image!");
     pass_uninit(&pass);
     return false;
+}
+
+bool pl_render_image(pl_renderer rr, const struct pl_frame *image,
+                     const struct pl_frame *target,
+                     const struct pl_render_params *params)
+{
+    rr->fallback_peak_owner = NULL;
+    bool ok = render_image(rr, image, target, params, NULL);
+    if (ok)
+        rr->last_source_peak_valid = false;
+    return ok;
 }
 
 const struct pl_frame *pl_frame_mix_current(const struct pl_frame_mix *mix)
@@ -3835,17 +4384,17 @@ const struct pl_frame *pl_frame_mix_current(const struct pl_frame_mix *mix)
     return cur;
 }
 
-const struct pl_frame *pl_frame_mix_nearest(const struct pl_frame_mix *mix)
+static int frame_mix_nearest_index(const struct pl_frame_mix *mix)
 {
     if (!mix->num_frames)
-        return NULL;
+        return -1;
 
-    const struct pl_frame *best = mix->frames[0];
+    int best = 0;
     double best_dist = fabs(mix->timestamps[0]);
     for (int i = 1; i < mix->num_frames; i++) {
         double dist = fabs(mix->timestamps[i]);
         if (dist < best_dist) {
-            best = mix->frames[i];
+            best = i;
             best_dist = dist;
             continue;
         } else {
@@ -3854,6 +4403,12 @@ const struct pl_frame *pl_frame_mix_nearest(const struct pl_frame_mix *mix)
     }
 
     return best;
+}
+
+const struct pl_frame *pl_frame_mix_nearest(const struct pl_frame_mix *mix)
+{
+    int index = frame_mix_nearest_index(mix);
+    return index >= 0 ? mix->frames[index] : NULL;
 }
 
 struct params_info {
@@ -3913,9 +4468,23 @@ static struct params_info render_params_info(const struct pl_render_params *para
         if (hook->stages == PL_HOOK_OUTPUT)
             continue; // ignore hooks only relevant to pass_output_target
         pl_hash_merge(&info.hash, pl_var_hash(*hook));
+        for (int j = 0; j < hook->num_parameters; j++) {
+            const struct pl_hook_par *par = &hook->parameters[j];
+            bool source_bound = false;
+            for (int k = 0; k < params.num_source_parameters; k++)
+                source_bound |= params.source_parameters[k] == par;
+            pl_hash_merge(&info.hash, pl_var_hash(par->type));
+            pl_hash_merge(&info.hash, pl_var_hash(source_bound));
+            if (!source_bound) {
+                pl_hash_merge(&info.hash, pl_mem_hash(par->data,
+                                                    pl_var_type_size(par->type)));
+            }
+        }
         info.trivial = false;
     }
     params.hooks = NULL;
+    params.source_parameters = NULL;
+    params.num_source_parameters = 0;
 
     // Hash the LUT by only looking at the signature
     if (params.lut) {
@@ -4025,42 +4594,143 @@ static struct pl_motion_estimate_frame interp_frame(const struct cached_frame *f
     return frame;
 }
 
-bool pl_render_image_mix(pl_renderer rr, const struct pl_frame_mix *images,
-                         const struct pl_frame *ptarget,
-                         const struct pl_render_params *params)
+static bool source_parameters_valid(const struct pl_render_params *params)
 {
-    if (!images->num_frames)
+    if (params->num_source_parameters < 0 ||
+        (params->num_source_parameters && !params->source_parameters))
+        return false;
+    for (int i = 0; i < params->num_source_parameters; i++) {
+        const struct pl_hook_par *par = params->source_parameters[i];
+        if (!par)
+            return false;
+        bool found = false;
+        for (int h = 0; h < params->num_hooks && !found; h++) {
+            const struct pl_hook *hook = params->hooks ? params->hooks[h] : NULL;
+            if (!hook || (hook->num_parameters && !hook->parameters))
+                return false;
+            for (int j = 0; j < hook->num_parameters; j++)
+                found |= par == &hook->parameters[j];
+        }
+        if (!found)
+            return false;
+    }
+    return true;
+}
+
+static bool custom_mix_field_supported(const struct pl_frame *image,
+                                       const struct pl_render_params *params)
+{
+    if (image->field == PL_FIELD_NONE)
+        return true;
+
+    const struct pl_deinterlace_params *deint = params->deinterlace_params;
+    return deint && deint->algo > PL_DEINTERLACE_WEAVE &&
+           deint->algo < PL_DEINTERLACE_ALGORITHM_COUNT &&
+           (image->field == PL_FIELD_TOP || image->field == PL_FIELD_BOTTOM) &&
+           (image->first_field == PL_FIELD_TOP || image->first_field == PL_FIELD_BOTTOM);
+}
+
+static bool custom_mix_has_errors(pl_renderer rr)
+{
+    return rr->errors & ~PL_RENDER_ERR_FRAME_INTERPOLATION;
+}
+
+static bool same_field_view(const struct pl_frame *a, const struct pl_frame *b)
+{
+    return a->field == b->field &&
+           (a->field == PL_FIELD_NONE || a->first_field == b->first_field);
+}
+
+static bool render_image_mix(pl_renderer rr, const struct pl_frame_mix *images,
+                              const struct pl_frame *ptarget,
+                              const struct pl_render_params *params,
+                              const struct pl_custom_frame_mixer *custom,
+                              const struct pl_source_peak_context *source)
+{
+    const char *failure = "configuration";
+    if (!custom && !images->num_frames)
         return pl_render_image(rr, NULL, ptarget, params);
 
     struct pl_render_params fixed;
     params = fix_params(&fixed, params);
+    require(source_parameters_valid(params));
     struct params_info par_info = render_params_info(params);
     pl_dispatch_mark_dynamic(rr->dp, params->dynamic_constants);
 
     require(images->num_frames >= 1);
+    require(images->frames && images->signatures && images->timestamps);
     require(images->vsync_duration > 0.0);
     for (int i = 0; i < images->num_frames - 1; i++)
         require(images->timestamps[i] <= images->timestamps[i+1]);
 
-    const struct pl_frame *refimg = pl_frame_mix_nearest(images);
+    if (custom) {
+        require(custom->mix);
+        require(images->num_frames <= MAX_MIX_FRAMES);
+        require(isfinite(images->vsync_duration));
+        if ((!source && params->peak_detect_params) || params->force_low_bit_depth_fbos ||
+            (params->lut && params->lut_type == PL_LUT_CONVERSION) ||
+            ptarget->icc || ptarget->profile.data || ptarget->lut ||
+            ptarget->repr.sys == PL_COLOR_SYSTEM_XYZ || custom_mix_has_errors(rr))
+        {
+            PL_ERR(rr, "Custom frame mix failed: unsupported configuration (errors=0x%x)",
+                   rr->errors);
+            return false;
+        }
+        for (int i = 0; i < images->num_frames; i++) {
+            require(images->frames[i]);
+            require(isfinite(images->timestamps[i]));
+            if (!custom_mix_field_supported(images->frames[i], params)) {
+                PL_ERR(rr, "Custom frame mix failed: unsupported field view %d", i);
+                return false;
+            }
+            if (i)
+                require(images->timestamps[i-1] < images->timestamps[i]);
+            for (int j = 0; j < i; j++)
+                require(images->signatures[i] != images->signatures[j]);
+        }
+    }
+
+    int ref_index = frame_mix_nearest_index(images);
+    const struct pl_frame *refimg = images->frames[ref_index];
+    if (source && !source_peak_prepare(source, source->ids[ref_index]))
+        return false;
+    struct source_peak_record *refpeak = source
+        ? source_peak_find(source->state, source->ids[ref_index]) : NULL;
     struct pass_state pass = {
         .rr = rr,
         .params = params,
         .image = *refimg,
         .target = *ptarget,
         .info.stage = PL_RENDER_STAGE_BLEND,
+        .custom_mixer = !!custom,
+        .source_peak = refpeak,
     };
 
     if (rr->errors & PL_RENDER_ERR_FRAME_MIXING)
         goto fallback;
-    if (!pass_init(&pass, false))
+    if (!pass_init(&pass, false)) {
+        PL_ERR(rr, "Frame mix failed: target initialization");
         return false;
+    }
+    if (custom && (pass.target.icc || pass.target.profile.data || pass.target.lut ||
+                   pass.target.repr.sys == PL_COLOR_SYSTEM_XYZ))
+        goto fallback;
+    failure = "intermediate format";
     if (!pass.fbofmt[4])
         goto fallback;
+
+    if (custom) {
+        pl_fmt fmt = pl_find_fmt(rr->gpu, PL_FMT_FLOAT, 4, 32, 32,
+                                 PL_FMT_CAP_RENDERABLE | PL_FMT_CAP_SAMPLEABLE);
+        if (!fmt)
+            goto fallback;
+        pass.fbofmt[4] = fmt;
+    }
 
     const struct pl_frame *target = &pass.target;
     int out_w = abs(pl_rect_w(pass.dst_rect)),
         out_h = abs(pl_rect_h(pass.dst_rect));
+    failure = "output dimensions";
     if (!out_w || !out_h)
         goto fallback;
 
@@ -4072,6 +4742,10 @@ restart: ;
     struct cached_frame frames[MAX_MIX_FRAMES];
     float weights[MAX_MIX_FRAMES];
     float wsum = 0.0;
+    struct pl_rendered_frame rendered[MAX_MIX_FRAMES];
+    int reference = -1;
+    uint64_t view_hash = pl_var_hash(pass.acquired_target.crop);
+    pl_hash_merge(&view_hash, pl_var_hash(target->rotation));
 
     // Garbage collect the cache by evicting all frames from the cache that are
     // not determined to still be required
@@ -4101,7 +4775,8 @@ restart: ;
     // Frame interpolation takes precedence over `frame_mixer`, which is only
     // used as a fallback when there is no pair of frames to interpolate, or
     // interpolation fails.
-    bool interp = params->frame_interp_params && images->num_frames > 1 &&
+    bool interp = !custom && params->frame_interp_params &&
+                  images->num_frames > 1 &&
                   !(rr->errors & PL_RENDER_ERR_FRAME_INTERPOLATION) &&
                   find_interp_pair(images, &interp_a, &interp_b, &interp_t);
 
@@ -4118,15 +4793,19 @@ retry:
 
         // Combining images with different rotations is basically unfeasible
         if (pl_rotation_normalize(img->rotation - refimg->rotation)) {
+            if (custom)
+                goto fallback;
             PL_TRACE(rr, "  -> Skipping: incompatible rotation");
             continue;
         }
 
         float weight;
-        if (single_frame) {
+        if (custom) {
+            weight = 1.0f;
+        } else if (single_frame) {
 
             // Only render the refimg, ignore others
-            if (img == refimg) {
+            if (i == ref_index) {
                 weight = 1.0;
             } else {
                 PL_TRACE(rr, "  -> Skipping: no frame mixer");
@@ -4193,13 +4872,14 @@ retry:
         // also exclude the reference image from this optimization to ensure
         // that we always have at least one frame.
         const float cutoff = 1e-3;
-        if (fabsf(weight) <= cutoff && img != refimg) {
+        if (fabsf(weight) <= cutoff && i != ref_index) {
             PL_TRACE(rr, "   -> Skipping: weight (%f) below threshold (%f)",
                      weight, cutoff);
             continue;
         }
 
-        bool skip_cache = single_frame && (params->skip_caching_single_frame || par_info.trivial);
+        bool skip_cache = !custom && single_frame &&
+                          (params->skip_caching_single_frame || par_info.trivial);
         if (!f && skip_cache) {
             PL_TRACE(rr, "Single frame not found in cache, bypassing");
             goto fallback;
@@ -4217,16 +4897,31 @@ retry:
 
         // Check to see if we can blindly reuse this cache entry. This is the
         // case if either the params are compatible, or the user doesn't care
-        bool can_reuse = f->tex;
+        if (source && !source_peak_prepare(source, source->ids[i])) {
+            pass_uninit(&pass);
+            return false;
+        }
+        struct source_peak_record *peak = source
+            ? source_peak_find(source->state, source->ids[i]) : NULL;
+        failure = "unsupported source peak";
+        if (custom && peak && peak->status == PL_SOURCE_PEAK_UNSUPPORTED &&
+            (!peak->target_relative || !pl_color_space_is_hdr(&target->color)))
+            goto fallback;
+        bool can_reuse = f->tex && f->valid && f->custom == !!custom &&
+                         f->peak_owner == (source ? source->state : NULL) &&
+                         f->peak_id == (peak ? peak->presentation_id : 0);
         bool strict_reuse = skip_cache || single_frame ||
-                            !params->preserve_mixing_cache;
+                            !params->preserve_mixing_cache || custom || source;
         if (can_reuse && strict_reuse) {
             can_reuse = f->tex->params.w == out_w &&
                         f->tex->params.h == out_h &&
                         pl_rect2d_eq(f->crop, img->crop) &&
                         f->params_hash == par_info.hash &&
-                        pl_color_space_equal(&f->color, &target->color) &&
+                        pl_color_space_equal(custom ? &f->view_color : &f->color,
+                                             &target->color) &&
                         pl_icc_profile_equal(&f->profile, &target->profile);
+            if (custom)
+                can_reuse &= f->content_id && f->view_hash == view_hash;
         } else if (can_reuse && interp) {
             // Motion estimation and frame interpolation need both frames at
             // the same size, if frames have resized we need to re-render.
@@ -4234,12 +4929,15 @@ retry:
                         f->tex->params.h == out_h;
         }
 
+        failure = "source preparation";
         if (!can_reuse && skip_cache) {
             PL_TRACE(rr, "Single frame cache entry invalid, bypassing");
             goto fallback;
         }
 
         if (!can_reuse) {
+            f->valid = false;
+            f->content_id = 0;
             // If we can't reuse the entry, we need to re-render this frame
             PL_TRACE(rr, "  -> Cached texture missing or invalid.. (re)creating");
             if (!f->tex) {
@@ -4268,30 +4966,75 @@ retry:
                 .rr = rr,
                 .params = pass.params,
                 .image = *img,
-                .target = *ptarget,
+                .target = pass.acquired_target,
                 .info.stage = PL_RENDER_STAGE_FRAME,
                 .acquired = pass.acquired,
+                .borrowed_target = true,
+                .source_peak = peak,
             };
+            if (custom)
+                inter_pass.target.color = pass.target.color;
 
             // Render a single frame up to `pass_output_target`
             memcpy(inter_pass.fbofmt, pass.fbofmt, sizeof(pass.fbofmt));
+            failure = "source acquire";
             if (!pass_init(&inter_pass, true))
                 goto fail;
 
-            pass_begin_frame(&inter_pass);
+            // A prepared field must still represent the queued time and parity.
+            failure = "source field/rotation";
+            if (custom && (!same_field_view(img, &inter_pass.image) ||
+                (img->field != PL_FIELD_NONE && !inter_pass.fbofmt[4]) ||
+                pl_rotation_normalize(inter_pass.image.rotation - refimg->rotation)))
+            {
+                ok = false;
+                goto inter_pass_error;
+            }
+
+            if (custom && frame_needs_dovi_el(&inter_pass.image)) {
+                const struct pl_frame *el = inter_pass.image.enhancement_layer;
+                if (!el || inter_pass.image.field != PL_FIELD_NONE ||
+                    el->field != PL_FIELD_NONE)
+                {
+                    PL_ERR(rr, "Custom frame mixing requires a complete Dolby Vision frame.");
+                    ok = false;
+                    goto inter_pass_error;
+                }
+            }
+
+            failure = "source frame begin";
+            if (!(ok = pass_begin_frame(&inter_pass)))
+                goto inter_pass_error;
+            failure = "source read";
             if (!(ok = pass_read_image(&inter_pass)))
                 goto inter_pass_error;
+            failure = "target-relative source";
+            if (custom && peak && peak->target_relative &&
+                (inter_pass.image.color.transfer != PL_COLOR_TRC_HLG ||
+                 view_needs_peak(&inter_pass.image.color, &inter_pass.img.color.hdr,
+                                  &inter_pass.target.color, inter_pass.params)))
+            {
+                pass_uninit(&inter_pass);
+                goto fallback;
+            }
+            failure = "source scale";
             if (!(ok = pass_scale_main(&inter_pass)))
                 goto inter_pass_error;
-            pass_convert_colors(&inter_pass);
+            failure = "source colors";
+            pass_convert_colors(&inter_pass, !!custom);
 
             pl_assert(inter_pass.img.sh); // guaranteed by `pass_convert_colors`
+            if (custom) {
+                pl_shader_set_alpha(inter_pass.img.sh, &inter_pass.img.repr,
+                                    PL_ALPHA_INDEPENDENT);
+            }
             pl_shader_set_alpha(inter_pass.img.sh, &inter_pass.img.repr,
                                 PL_ALPHA_PREMULTIPLIED); // for frame mixing
 
             pl_assert(inter_pass.img.w == out_w &&
                       inter_pass.img.h == out_h);
 
+            failure = "source dispatch";
             ok = pl_dispatch_finish(rr->dp, pl_dispatch_params(
                 .shader = &inter_pass.img.sh,
                 .target = f->tex,
@@ -4315,12 +5058,20 @@ retry:
                 PL_SWAP(shift.mat.m[1][0], shift.mat.m[1][1]);
             }
 
-            draw_overlays(&inter_pass, f->tex, inter_pass.img.comps, NULL,
-                          inter_pass.image.overlays,
-                          inter_pass.image.num_overlays,
-                          inter_pass.img.color,
-                          inter_pass.img.repr,
-                          &shift);
+            if (!custom) {
+                draw_overlays(&inter_pass, f->tex, inter_pass.img.comps, NULL,
+                              inter_pass.image.overlays,
+                              inter_pass.image.num_overlays,
+                              inter_pass.img.color,
+                              inter_pass.img.repr,
+                              &shift);
+            }
+
+            failure = "source renderer error";
+            if (custom && custom_mix_has_errors(rr)) {
+                ok = false;
+                goto inter_pass_error;
+            }
 
             f->params_hash = par_info.hash;
             f->crop = img->crop;
@@ -4328,10 +5079,19 @@ retry:
             f->repr = inter_pass.img.repr;
             f->comps = inter_pass.img.comps;
             f->profile = target->profile;
+            f->custom = !!custom;
+            f->view_hash = view_hash;
+            f->view_color = target->color;
+            f->valid = true;
+            f->peak_owner = source ? source->state : NULL;
+            f->peak_id = peak ? peak->presentation_id : 0;
+            if (custom) {
+                pl_assert(rr->rendered_id < UINT64_MAX);
+                f->content_id = ++rr->rendered_id;
+            }
             // fall through
 
 inter_pass_error:
-            inter_pass.acquired.target = false; // don't release target
             pass_uninit(&inter_pass);
             if (!ok)
                 goto fail;
@@ -4339,6 +5099,15 @@ inter_pass_error:
 
         pl_assert(fidx < MAX_MIX_FRAMES);
         frames[fidx] = *f;
+        if (custom) {
+            rendered[fidx] = (struct pl_rendered_frame) {
+                .texture = f->tex,
+                .signature = f->content_id,
+                .timestamp = images->timestamps[i],
+            };
+            if (i == ref_index)
+                reference = fidx;
+        }
         weights[fidx] = weight;
         wsum += weight;
         fidx++;
@@ -4349,7 +5118,8 @@ inter_pass_error:
         if (rr->frames.elem[i].evict) {
             PL_TRACE(rr, "Evicting frame with signature %llx from cache",
                      (unsigned long long) rr->frames.elem[i].signature);
-            PL_ARRAY_APPEND(rr, rr->frame_fbos, rr->frames.elem[i].tex);
+            if (rr->frames.elem[i].tex)
+                PL_ARRAY_APPEND(rr, rr->frame_fbos, rr->frames.elem[i].tex);
             PL_ARRAY_REMOVE_AT(rr->frames, i);
             continue;
         } else {
@@ -4366,9 +5136,90 @@ inter_pass_error:
     }
 
     // Sample and mix the output color
-    pass_begin_frame(&pass);
+    if (!custom && !pass_begin_frame(&pass))
+        goto fallback;
     pass.info.count = fidx;
     pl_assert(fidx > 0);
+
+    if (custom) {
+        pl_assert(fidx == images->num_frames && reference >= 0);
+        struct pl_color_space color = target->color;
+        color.transfer = PL_COLOR_TRC_LINEAR_HDR;
+        failure = "texture callback/output";
+        pl_tex mixed = custom->mix(custom->priv, &(struct pl_rendered_mix) {
+            .frames = rendered,
+            .num_frames = fidx,
+            .reference = reference,
+            .color = color,
+        });
+        if (!mixed || !mixed->params.sampleable || mixed->params.w != out_w ||
+            mixed->params.h != out_h || mixed->params.d ||
+            mixed->params.format->type != PL_FMT_FLOAT ||
+            mixed->params.format->num_components != 4)
+            goto fallback;
+        for (int c = 0; c < 4; c++) {
+            if (mixed->params.format->component_depth[c] != 32)
+                goto fallback;
+        }
+
+        // A source may supply overlays in acquire, and release may invalidate
+        // them. Acquire the reference again only after all source preparation,
+        // preserving the single mapped source contract through final output.
+        struct pass_state output = {
+            .rr = rr,
+            .params = params,
+            .image = *refimg,
+            .target = pass.acquired_target,
+            .info.stage = PL_RENDER_STAGE_BLEND,
+            .info.count = fidx,
+            .custom_mixer = true,
+            .borrowed_target = true,
+            .acquired.target = pass.acquired.target,
+            .source_peak = refpeak,
+        };
+        output.target.color = pass.target.color;
+        memcpy(output.fbofmt, pass.fbofmt, sizeof(pass.fbofmt));
+        failure = "output reference acquire";
+        if (!pass_init(&output, true))
+            goto fallback;
+        failure = "output reference field/geometry";
+        if (!same_field_view(refimg, &output.image) ||
+            output.rotation != pass.rotation ||
+            !pl_rect2d_eq(output.dst_rect, pass.dst_rect))
+        {
+            pass_uninit(&output);
+            goto fallback;
+        }
+        failure = "output frame begin";
+        if (!pass_begin_frame(&output)) {
+            pass_uninit(&output);
+            goto fallback;
+        }
+        pl_shader sh = pl_dispatch_begin(rr->dp);
+        pl_shader_sample_direct(sh, pl_sample_src( .tex = mixed ));
+        output.img = (struct img) {
+            .sh = sh,
+            .w = out_w,
+            .h = out_h,
+            .comps = 4,
+            .color = target->color,
+            .rect = {0, 0, out_w, out_h},
+            .repr = {
+                .sys = PL_COLOR_SYSTEM_RGB,
+                .levels = PL_COLOR_LEVELS_FULL,
+                .alpha = PL_ALPHA_PREMULTIPLIED,
+            },
+        };
+        pl_shader_set_alpha(sh, &output.img.repr, PL_ALPHA_INDEPENDENT);
+        pl_shader_delinearize(sh, &target->color);
+        pl_shader_set_alpha(sh, &output.img.repr, PL_ALPHA_PREMULTIPLIED);
+        bool ok = pass_output_target(&output) && !custom_mix_has_errors(rr);
+        if (!ok)
+            PL_ERR(rr, "Custom frame mix failed: final output (errors=0x%x)", rr->errors);
+        pass_uninit(&output);
+        pass_uninit(&pass);
+        return ok;
+    }
 
     // With a single frame there is nothing to mix, so we can skip the
     // linearize/delinearize roundtrip.
@@ -4496,16 +5347,167 @@ mixed:
     return true;
 
 fail:
+    if (custom) {
+        PL_ERR(rr, "Could not prepare image for custom frame mixing!");
+        goto fallback;
+    }
     PL_ERR(rr, "Could not render image for frame mixing.. disabling!");
     rr->errors |= PL_RENDER_ERR_FRAME_MIXING;
     // fall through
 
 fallback:
     pass_uninit(&pass);
-    return pl_render_image(rr, refimg, ptarget, params);
+    if (custom) {
+        PL_ERR(rr, "Custom frame mix failed: %s (errors=0x%x)", failure, rr->errors);
+        return false;
+    }
+    return render_image(rr, refimg, ptarget, params, refpeak);
 
 error: // for parameter validation failures
     return false;
+}
+
+bool pl_render_image_mix(pl_renderer rr, const struct pl_frame_mix *images,
+                         const struct pl_frame *target,
+                         const struct pl_render_params *params)
+{
+    rr->fallback_peak_owner = NULL;
+    bool ok = render_image_mix(rr, images, target, params, NULL, NULL);
+    if (ok)
+        rr->last_source_peak_valid = false;
+    return ok;
+}
+
+bool pl_render_image_mix_custom(pl_renderer rr, const struct pl_frame_mix *images,
+                                const struct pl_frame *target,
+                                const struct pl_render_params *params,
+                                const struct pl_custom_frame_mixer *mixer)
+{
+    if (!mixer)
+        return false;
+    rr->fallback_peak_owner = NULL;
+    bool ok = render_image_mix(rr, images, target, params, mixer, NULL);
+    if (ok)
+        rr->last_source_peak_valid = false;
+    return ok;
+}
+
+static bool source_field_pair(const struct pl_frame *first, const struct pl_frame *second)
+{
+    return first && second &&
+           (first->field == PL_FIELD_TOP || first->field == PL_FIELD_BOTTOM) &&
+           first->field == first->first_field &&
+           second->first_field == first->field &&
+           second->field == pl_field_other(first->field);
+}
+
+static bool source_render_begin(pl_renderer rr, const struct pl_render_params *params,
+                                const struct pl_source_peak_context *source,
+                                int num_frames, const struct pl_frame * const *field_views)
+{
+    if (!rr || !source || !source->state || source->state->active ||
+        source->state->gpu != rr->gpu || !source->ids || num_frames < 1)
+    {
+        if (rr)
+            PL_ERR(rr, "Source render failed: invalid context/state (frames=%d)", num_frames);
+        return false;
+    }
+    for (int i = 0; i < num_frames; i++) {
+        if (!source->ids[i] || (i && source->ids[i-1] > source->ids[i]) ||
+            !source_peak_find(source->state, source->ids[i]))
+            return source_render_error(source, "missing/unordered view", source->ids[i]);
+        if (i && source->ids[i-1] == source->ids[i] &&
+            (!field_views || !source_field_pair(field_views[i-1], field_views[i])))
+            return source_render_error(source, "duplicate non-field view", source->ids[i]);
+    }
+    if (!source_peak_find(source->state, source->current_id) ||
+        source->retire_before_id > source->current_id ||
+        source->retire_before_id > source->ids[0])
+        return source_render_error(source, "current/retirement boundary", source->current_id);
+    const struct pl_render_params *effective = PL_DEF(params, &pl_render_default_params);
+    pl_source_peak_state state = source->state;
+    if (state->enabled != !!effective->peak_detect_params ||
+        (state->enabled && (!sh_peak_params_equal(&state->params,
+                                                effective->peak_detect_params) ||
+         state->params.allow_delayed != effective->peak_detect_params->allow_delayed)))
+    {
+        PL_ERR(rr, "Source peak parameters differ (enabled=%d/%d delayed=%d/%d)",
+               state->enabled, !!effective->peak_detect_params,
+               state->params.allow_delayed,
+               effective->peak_detect_params ? effective->peak_detect_params->allow_delayed : 0);
+        return source_render_error(source, "peak parameter mismatch", source->current_id);
+    }
+
+    state->active = true;
+    if (!source_peak_prepare(source, source->current_id)) {
+        state->active = false;
+        return false;
+    }
+    return true;
+}
+
+static bool source_render_finish(pl_renderer rr,
+                                 const struct pl_source_peak_context *source, bool ok)
+{
+    if (ok) {
+        struct source_peak_record *current = source_peak_find(source->state,
+                                                              source->current_id);
+        rr->last_source_peak = current->presentation;
+        rr->last_source_peak_valid = true;
+        source_peak_commit(source);
+    }
+    source->state->active = false;
+    return ok;
+}
+
+static bool source_render_empty(pl_renderer rr, const struct pl_frame *target,
+                                const struct pl_render_params *params,
+                                const struct pl_source_peak_context *source)
+{
+    if (!rr || !source || !source->state || source->state->active ||
+        source->state->gpu != rr->gpu)
+        return false;
+    source->state->active = true;
+    bool ok = render_image(rr, NULL, target, params, NULL);
+    if (ok) {
+        rr->last_source_peak = (struct sh_peak_result) {0};
+        rr->last_source_peak_valid = true;
+    }
+    source->state->active = false;
+    return ok;
+}
+
+bool pl_render_image_source(pl_renderer rr, const struct pl_frame *image,
+                            const struct pl_frame *target,
+                            const struct pl_render_params *params,
+                            const struct pl_source_peak_context *source)
+{
+    if (!image)
+        return source_render_empty(rr, target, params, source);
+    if (!source_render_begin(rr, params, source, 1, NULL))
+        return false;
+    bool ok = source_peak_prepare(source, source->ids[0]);
+    if (ok) {
+        struct source_peak_record *view = source_peak_find(source->state, source->ids[0]);
+        ok = render_image(rr, image, target, params, view);
+    }
+    return source_render_finish(rr, source, ok);
+}
+
+bool pl_render_image_mix_source(pl_renderer rr, const struct pl_frame_mix *images,
+                                const struct pl_frame *target,
+                                const struct pl_render_params *params,
+                                const struct pl_source_peak_context *source,
+                                const struct pl_custom_frame_mixer *mixer)
+{
+    if (!images || images->num_frames < 0 || (mixer && !mixer->mix))
+        return false;
+    if (!images->num_frames)
+        return source_render_empty(rr, target, params, source);
+    if (!source_render_begin(rr, params, source, images->num_frames, images->frames))
+        return false;
+    bool ok = render_image_mix(rr, images, target, params, mixer, source);
+    return source_render_finish(rr, source, ok);
 }
 
 void pl_frames_infer_mix(pl_renderer rr, const struct pl_frame_mix *mix,

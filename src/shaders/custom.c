@@ -21,6 +21,7 @@
 
 bool pl_shader_custom(pl_shader sh, const struct pl_custom_shader *params)
 {
+    sh->opaque = true;
     if (params->compute) {
         int bw = PL_DEF(params->compute_group_size[0], 16);
         int bh = PL_DEF(params->compute_group_size[1], 16);

@@ -750,7 +750,7 @@ void pl_shader_linearize(pl_shader sh, const struct pl_color_space *csp)
     if (!sh_require(sh, PL_SHADER_SIG_COLOR, 0, 0))
         return;
 
-    if (csp->transfer == PL_COLOR_TRC_LINEAR)
+    if (pl_color_transfer_is_normalized_linear(csp->transfer))
         return;
 
     float csp_min, csp_max;
@@ -870,6 +870,7 @@ void pl_shader_linearize(pl_shader sh, const struct pl_color_space *csp)
              PL_COLOR_SCRGB_WHITE / PL_COLOR_SDR_WHITE);
         return;
     case PL_COLOR_TRC_LINEAR:
+    case PL_COLOR_TRC_LINEAR_HDR:
     case PL_COLOR_TRC_COUNT:
         break;
     }
@@ -888,7 +889,7 @@ void pl_shader_delinearize(pl_shader sh, const struct pl_color_space *csp)
     if (!sh_require(sh, PL_SHADER_SIG_COLOR, 0, 0))
         return;
 
-    if (csp->transfer == PL_COLOR_TRC_LINEAR)
+    if (pl_color_transfer_is_normalized_linear(csp->transfer))
         return;
 
     float csp_min, csp_max;
@@ -1008,6 +1009,7 @@ void pl_shader_delinearize(pl_shader sh, const struct pl_color_space *csp)
              PL_COLOR_SDR_WHITE / PL_COLOR_SCRGB_WHITE);
         return;
     case PL_COLOR_TRC_LINEAR:
+    case PL_COLOR_TRC_LINEAR_HDR:
     case PL_COLOR_TRC_COUNT:
         break;
     }
@@ -1102,13 +1104,14 @@ static bool use_mastering_space(const struct pl_color_space *csp,
     return true;
 }
 
-static bool peak_detect_params_eq(const struct pl_peak_detect_params *a,
-                                  const struct pl_peak_detect_params *b)
+bool sh_peak_params_equal(const struct pl_peak_detect_params *a,
+                           const struct pl_peak_detect_params *b)
 {
     return a->smoothing_period     == b->smoothing_period     &&
            a->scene_threshold_low  == b->scene_threshold_low  &&
            a->scene_threshold_high == b->scene_threshold_high &&
-           a->percentile           == b->percentile;
+           a->percentile           == b->percentile           &&
+           a->black_cutoff         == b->black_cutoff;
     // don't compare `allow_delayed` because it doesn't change measurement
 }
 
@@ -1180,6 +1183,18 @@ static const struct pl_buffer_var peak_buf_vars[] = {
 #undef VAR
 };
 
+struct peak_buffer {
+    struct pl_peak_detect_params params;
+    pl_buf buf;
+    pl_buf readback;
+};
+
+struct peak_measurement {
+    struct peak_buffer buffer;
+    struct sh_peak_result result;
+    bool ready, failed;
+};
+
 struct sh_color_map_obj {
     // Tone map state
     struct {
@@ -1195,17 +1210,8 @@ struct sh_color_map_obj {
 
     // Peak detection state
     struct {
-        struct pl_peak_detect_params params;    // currently active parameters
-        pl_buf buf;                             // pending peak detection buffer
-        pl_buf readback;                        // readback buffer (fallback)
-        float avg_pq;                           // current (smoothed) values
-        float max_pq;
-        float scene_avg_pq;                     // scene average light level
-                                                // (mean of linear maxRGB),
-                                                // stored as PQ of the mean
-        float scene_max_pq;                     // scene peak light level in PQ
-                                                // (maximum of maxRGB), in PQ
-        float max_y_pq;                         // maximum PQ luminance
+        struct peak_buffer buffer;
+        struct sh_peak_result result; // temporally smoothed statistics
     } peak;
 };
 
@@ -1227,8 +1233,8 @@ static void sh_color_map_uninit(pl_gpu gpu, void *ptr)
     struct sh_color_map_obj *obj = ptr;
     pl_shader_obj_destroy(&obj->tone.lut);
     pl_shader_obj_destroy(&obj->gamut.lut);
-    pl_buf_destroy(gpu, &obj->peak.buf);
-    pl_buf_destroy(gpu, &obj->peak.readback);
+    pl_buf_destroy(gpu, &obj->peak.buffer.buf);
+    pl_buf_destroy(gpu, &obj->peak.buffer.readback);
     memset(obj, 0, sizeof(*obj));
 }
 
@@ -1287,32 +1293,148 @@ static float measure_peak(const struct peak_buf_data *data, float percentile,
     pl_unreachable();
 }
 
-// if `force` is true, ensures the buffer is read, even if `allow_delayed`
-static void update_peak_buf(pl_gpu gpu, struct sh_color_map_obj *obj, bool force)
+static struct sh_peak_result reduce_peak_buffer(
+    const struct peak_buf_data *data, const struct pl_peak_detect_params *params)
 {
-    const struct pl_peak_detect_params *params = &obj->peak.params;
-    if (!obj->peak.buf)
-        return;
+    uint64_t frame_sum_pq = 0u, frame_sum_lin = 0u,
+             frame_wg_count = 0u, frame_wg_active = 0u;
+    unsigned frame_max_rgb = 0u;
+    for (int k = 0; k < SLICES; k++) {
+        frame_sum_pq    += data->frame_sum_pq[k];
+        frame_sum_lin   += data->frame_sum_lin[k];
+        frame_max_rgb    = PL_MAX(frame_max_rgb, data->frame_max_rgb[k]);
+        frame_wg_count  += data->frame_wg_count[k];
+        frame_wg_active += data->frame_wg_active[k];
+    }
+    float avg_pq, max_pq, scene_avg_pq, scene_max_pq, max_y_pq;
+    if (frame_wg_active) {
+        unsigned frame_max_y = data->frame_max_pq[0];
+        for (int k = 1; k < SLICES; k++)
+            frame_max_y = PL_MAX(frame_max_y, data->frame_max_pq[k]);
+        max_y_pq = (float) frame_max_y / PQ_MAX;
+        scene_avg_pq = pl_hdr_rescale(PL_HDR_NITS, PL_HDR_PQ, 10000.0f *
+                                      frame_sum_lin / (frame_wg_active * (float) LIN_MAX));
+        avg_pq = (float) frame_sum_pq / (frame_wg_active * PQ_MAX);
+        max_pq = pl_hdr_rescale(PL_HDR_NITS, PL_HDR_PQ, 10000.0f *
+                                frame_max_rgb / (float) LIN_MAX);
+        max_pq = measure_peak(data, params->percentile, max_pq);
+        scene_max_pq = max_pq;
+    } else {
+        // Solid black frame
+        avg_pq = max_pq = scene_avg_pq = scene_max_pq = max_y_pq = PL_COLOR_HDR_BLACK;
+    }
 
-    if (!force && params->allow_delayed && pl_buf_poll(gpu, obj->peak.buf, 0))
-        return; // buffer not ready yet
+    return (struct sh_peak_result) {
+        .avg_pq = avg_pq,
+        .max_pq = max_pq,
+        .scene_avg_pq = scene_avg_pq,
+        .scene_max_pq = scene_max_pq,
+        .max_y_pq = max_y_pq,
+        .active_ratio = (float) frame_wg_active / frame_wg_count,
+    };
+}
+
+static enum sh_peak_status read_peak_buffer(pl_gpu gpu, struct peak_buffer *peak,
+                                           bool wait, struct sh_peak_result *out)
+{
+    if (!peak->buf)
+        return SH_PEAK_PENDING;
+    if (!wait && pl_buf_poll(gpu, peak->buf, 0))
+        return SH_PEAK_PENDING;
 
     bool ok;
     struct peak_buf_data data = {0};
-    if (obj->peak.readback) {
-        pl_buf_copy(gpu, obj->peak.readback, 0, obj->peak.buf, 0, sizeof(data));
-        ok = pl_buf_read(gpu, obj->peak.readback, 0, &data, sizeof(data));
+    if (peak->readback) {
+        pl_buf_copy(gpu, peak->readback, 0, peak->buf, 0, sizeof(data));
+        ok = pl_buf_read(gpu, peak->readback, 0, &data, sizeof(data));
     } else {
-        ok = pl_buf_read(gpu, obj->peak.buf, 0, &data, sizeof(data));
+        ok = pl_buf_read(gpu, peak->buf, 0, &data, sizeof(data));
     }
-    if (ok && data.frame_wg_count[0] > 0) {
-        // Peak detection completed successfully
-        pl_buf_destroy(gpu, &obj->peak.buf);
+    if (!ok) {
+        PL_ERR(gpu, "Failed reading peak detection buffer!");
+        pl_buf_destroy(gpu, &peak->buf);
+        return SH_PEAK_ERROR;
+    }
+    if (!data.frame_wg_count[0])
+        return SH_PEAK_PENDING; // measurement shader not dispatched yet
+
+    pl_buf_destroy(gpu, &peak->buf);
+    *out = reduce_peak_buffer(&data, &peak->params);
+    return SH_PEAK_READY;
+}
+
+void sh_peak_smooth(struct sh_peak_result *history,
+                    const struct sh_peak_result *sample,
+                    const struct pl_peak_detect_params *params)
+{
+    params = PL_DEF(params, &pl_peak_detect_default_params);
+    float avg_pq = sample->avg_pq, max_pq = sample->max_pq;
+    float scene_avg_pq = sample->scene_avg_pq;
+    float scene_max_pq = sample->scene_max_pq, max_y_pq = sample->max_y_pq;
+    if (!history->avg_pq) {
+        // Set the initial value accordingly if it contains no data
+        history->avg_pq = avg_pq;
+        history->max_pq = max_pq;
+        history->scene_avg_pq = scene_avg_pq;
+        history->scene_max_pq = scene_max_pq;
+        history->max_y_pq = max_y_pq;
     } else {
-        // No data read? Possibly this peak obj has not been executed yet
-        if (!ok) {
-            PL_ERR(gpu, "Failed reading peak detection buffer!");
-        } else if (params->allow_delayed) {
+        // Ignore small deviations from existing peak (rounding error)
+        static const float epsilon = 1.0f / PQ_MAX;
+        if (fabsf(avg_pq - history->avg_pq) < epsilon)
+            avg_pq = history->avg_pq;
+        if (fabsf(max_pq - history->max_pq) < epsilon)
+            max_pq = history->max_pq;
+        if (fabsf(scene_avg_pq - history->scene_avg_pq) < epsilon)
+            scene_avg_pq = history->scene_avg_pq;
+        if (fabsf(scene_max_pq - history->scene_max_pq) < epsilon)
+            scene_max_pq = history->scene_max_pq;
+        if (fabsf(max_y_pq - history->max_y_pq) < epsilon)
+            max_y_pq = history->max_y_pq;
+    }
+
+    // Use an IIR low-pass filter to smooth out the detected values
+    const float coeff = iir_coeff(params->smoothing_period);
+    history->avg_pq += coeff * (avg_pq - history->avg_pq);
+    history->max_pq += coeff * (max_pq - history->max_pq);
+    history->scene_avg_pq += coeff * (scene_avg_pq - history->scene_avg_pq);
+    history->scene_max_pq += coeff * (scene_max_pq - history->scene_max_pq);
+    history->max_y_pq += coeff * (max_y_pq - history->max_y_pq);
+
+    // Scene change hysteresis
+    if (params->scene_threshold_low > 0 && params->scene_threshold_high > 0) {
+        const float log10_pq = 1e-2f; // experimentally determined approximate
+        const float thresh_low = params->scene_threshold_low * log10_pq;
+        const float thresh_high = params->scene_threshold_high * log10_pq;
+        const float bias = sample->active_ratio;
+        const float delta = bias * fabsf(avg_pq - history->avg_pq);
+        const float mix_coeff = pl_smoothstep(thresh_low, thresh_high, delta);
+        history->avg_pq = PL_MIX(history->avg_pq, avg_pq, mix_coeff);
+        history->max_pq = PL_MIX(history->max_pq, max_pq, mix_coeff);
+        history->scene_avg_pq = PL_MIX(history->scene_avg_pq, scene_avg_pq,
+                                        mix_coeff);
+        history->scene_max_pq = PL_MIX(history->scene_max_pq, scene_max_pq,
+                                        mix_coeff);
+        history->max_y_pq = PL_MIX(history->max_y_pq, max_y_pq, mix_coeff);
+    }
+    history->active_ratio = sample->active_ratio;
+}
+
+// Legacy API: consume its pending buffer and advance exactly as before.
+static void update_peak_buf(pl_gpu gpu, struct sh_color_map_obj *obj, bool force)
+{
+    struct peak_buffer *peak = &obj->peak.buffer;
+    if (!peak->buf)
+        return;
+    if (!force && peak->params.allow_delayed && pl_buf_poll(gpu, peak->buf, 0))
+        return;
+
+    struct sh_peak_result sample;
+    enum sh_peak_status status = read_peak_buffer(gpu, peak, true, &sample);
+    if (status == SH_PEAK_READY) {
+        sh_peak_smooth(&obj->peak.result, &sample, &peak->params);
+    } else if (status == SH_PEAK_PENDING) {
+        if (peak->params.allow_delayed) {
             PL_TRACE(gpu, "Peak detection buffer not yet ready, ignoring..");
         } else {
             PL_WARN(gpu, "Peak detection usage error: attempted detecting peak "
@@ -1320,95 +1442,14 @@ static void update_peak_buf(pl_gpu gpu, struct sh_color_map_obj *obj, bool force
                     "but `params->allow_delayed` is false! Ignoring, but "
                     "expect incorrect output.");
         }
-        if (force || !ok)
-            pl_buf_destroy(gpu, &obj->peak.buf);
-        return;
-    }
-
-    uint64_t frame_sum_pq = 0u, frame_sum_lin = 0u,
-             frame_wg_count = 0u, frame_wg_active = 0u;
-    unsigned frame_max_rgb = 0u;
-    for (int k = 0; k < SLICES; k++) {
-        frame_sum_pq    += data.frame_sum_pq[k];
-        frame_sum_lin   += data.frame_sum_lin[k];
-        frame_max_rgb    = PL_MAX(frame_max_rgb, data.frame_max_rgb[k]);
-        frame_wg_count  += data.frame_wg_count[k];
-        frame_wg_active += data.frame_wg_active[k];
-    }
-    float avg_pq, max_pq, scene_avg_pq, scene_max_pq, max_y_pq;
-    if (frame_wg_active) {
-        unsigned frame_max_y = data.frame_max_pq[0];
-        for (int k = 1; k < SLICES; k++)
-            frame_max_y = PL_MAX(frame_max_y, data.frame_max_pq[k]);
-        max_y_pq = (float) frame_max_y / PQ_MAX;
-        scene_avg_pq = pl_hdr_rescale(PL_HDR_NITS, PL_HDR_PQ, 10000.0f *
-                                      frame_sum_lin / (frame_wg_active * (float) LIN_MAX));
-        avg_pq = (float) frame_sum_pq / (frame_wg_active * PQ_MAX);
-        max_pq = pl_hdr_rescale(PL_HDR_NITS, PL_HDR_PQ, 10000.0f *
-                                frame_max_rgb / (float) LIN_MAX);
-        max_pq = measure_peak(&data, params->percentile, max_pq);
-        scene_max_pq = max_pq;
-    } else {
-        // Solid black frame
-        avg_pq = max_pq = scene_avg_pq = scene_max_pq = max_y_pq = PL_COLOR_HDR_BLACK;
-    }
-
-    if (!obj->peak.avg_pq) {
-        // Set the initial value accordingly if it contains no data
-        obj->peak.avg_pq = avg_pq;
-        obj->peak.max_pq = max_pq;
-        obj->peak.scene_avg_pq = scene_avg_pq;
-        obj->peak.scene_max_pq = scene_max_pq;
-        obj->peak.max_y_pq = max_y_pq;
-    } else {
-        // Ignore small deviations from existing peak (rounding error)
-        static const float epsilon = 1.0f / PQ_MAX;
-        if (fabsf(avg_pq - obj->peak.avg_pq) < epsilon)
-            avg_pq = obj->peak.avg_pq;
-        if (fabsf(max_pq - obj->peak.max_pq) < epsilon)
-            max_pq = obj->peak.max_pq;
-        if (fabsf(scene_avg_pq - obj->peak.scene_avg_pq) < epsilon)
-            scene_avg_pq = obj->peak.scene_avg_pq;
-        if (fabsf(scene_max_pq - obj->peak.scene_max_pq) < epsilon)
-            scene_max_pq = obj->peak.scene_max_pq;
-        if (fabsf(max_y_pq - obj->peak.max_y_pq) < epsilon)
-            max_y_pq = obj->peak.max_y_pq;
-    }
-
-    // Use an IIR low-pass filter to smooth out the detected values
-    const float coeff = iir_coeff(params->smoothing_period);
-    obj->peak.avg_pq += coeff * (avg_pq - obj->peak.avg_pq);
-    obj->peak.max_pq += coeff * (max_pq - obj->peak.max_pq);
-    obj->peak.scene_avg_pq += coeff * (scene_avg_pq - obj->peak.scene_avg_pq);
-    obj->peak.scene_max_pq += coeff * (scene_max_pq - obj->peak.scene_max_pq);
-    obj->peak.max_y_pq += coeff * (max_y_pq - obj->peak.max_y_pq);
-
-    // Scene change hysteresis
-    if (params->scene_threshold_low > 0 && params->scene_threshold_high > 0) {
-        const float log10_pq = 1e-2f; // experimentally determined approximate
-        const float thresh_low = params->scene_threshold_low * log10_pq;
-        const float thresh_high = params->scene_threshold_high * log10_pq;
-        const float bias = (float) frame_wg_active / frame_wg_count;
-        const float delta = bias * fabsf(avg_pq - obj->peak.avg_pq);
-        const float mix_coeff = pl_smoothstep(thresh_low, thresh_high, delta);
-        obj->peak.avg_pq = PL_MIX(obj->peak.avg_pq, avg_pq, mix_coeff);
-        obj->peak.max_pq = PL_MIX(obj->peak.max_pq, max_pq, mix_coeff);
-        obj->peak.scene_avg_pq = PL_MIX(obj->peak.scene_avg_pq, scene_avg_pq,
-                                        mix_coeff);
-        obj->peak.scene_max_pq = PL_MIX(obj->peak.scene_max_pq, scene_max_pq,
-                                        mix_coeff);
-        obj->peak.max_y_pq = PL_MIX(obj->peak.max_y_pq, max_y_pq, mix_coeff);
+        if (force)
+            pl_buf_destroy(gpu, &peak->buf);
     }
 }
 
-bool pl_shader_detect_peak(pl_shader sh, struct pl_color_space csp,
-                           pl_shader_obj *state,
-                           const struct pl_peak_detect_params *params)
+static bool setup_peak_compute(pl_shader sh,
+                                const struct pl_peak_detect_params *params)
 {
-    params = PL_DEF(params, &pl_peak_detect_default_params);
-    if (!sh_require(sh, PL_SHADER_SIG_COLOR, 0, 0))
-        return false;
-
     pl_gpu gpu = SH_GPU(sh);
     if (!gpu || gpu->limits.max_ssbo_size < sizeof(struct peak_buf_data)) {
         PL_ERR(sh, "HDR peak detection requires a GPU with support for at "
@@ -1429,30 +1470,27 @@ bool pl_shader_detect_peak(pl_shader sh, struct pl_color_space csp,
         return false;
     }
 
-    struct sh_color_map_obj *obj;
-    obj = SH_OBJ(sh, state, PL_SHADER_OBJ_COLOR_MAP, struct sh_color_map_obj,
-                 sh_color_map_uninit);
-    if (!obj)
-        return false;
+    return true;
+}
 
-    if (peak_detect_params_eq(&obj->peak.params, params)) {
-        update_peak_buf(gpu, obj, true); // prevent over-writing previous frame
-    } else {
-        pl_reset_detected_peak(*state);
-    }
-
-    pl_assert(!obj->peak.buf);
+static bool shader_measure_peak(pl_shader sh, struct pl_color_space csp,
+                                 struct peak_buffer *peak,
+                                 const struct pl_peak_detect_params *params)
+{
+    pl_gpu gpu = SH_GPU(sh);
+    const bool use_histogram = params->percentile > 0 && params->percentile < 100;
+    pl_assert(!peak->buf);
     static const struct peak_buf_data zero = {0};
 
 retry_ssbo:
-    if (obj->peak.readback) {
-        obj->peak.buf = pl_buf_create(gpu, pl_buf_params(
+    if (peak->readback) {
+        peak->buf = pl_buf_create(gpu, pl_buf_params(
             .size           = sizeof(struct peak_buf_data),
             .storable       = true,
             .initial_data   = &zero,
         ));
     } else {
-        obj->peak.buf = pl_buf_create(gpu, pl_buf_params(
+        peak->buf = pl_buf_create(gpu, pl_buf_params(
             .size           = sizeof(struct peak_buf_data),
             .memory_type    = PL_BUF_MEM_DEVICE,
             .host_readable  = true,
@@ -1461,23 +1499,23 @@ retry_ssbo:
         ));
     }
 
-    if (!obj->peak.buf && !obj->peak.readback) {
+    if (!peak->buf && !peak->readback) {
         PL_WARN(sh, "Failed creating host-readable peak detection SSBO, "
                 "retrying with fallback buffer");
-        obj->peak.readback = pl_buf_create(gpu, pl_buf_params(
+        peak->readback = pl_buf_create(gpu, pl_buf_params(
             .size           = sizeof(struct peak_buf_data),
             .host_readable  = true,
         ));
-        if (obj->peak.readback)
+        if (peak->readback)
             goto retry_ssbo;
     }
 
-    if (!obj->peak.buf) {
+    if (!peak->buf) {
         SH_FAIL(sh, "Failed creating peak detection SSBO!");
         return false;
     }
 
-    obj->peak.params = *params;
+    peak->params = *params;
 
     sh_desc(sh, (struct pl_shader_desc) {
         .desc = {
@@ -1485,7 +1523,7 @@ retry_ssbo:
             .type   = PL_DESC_BUF_STORAGE,
             .access = PL_DESC_ACCESS_READWRITE,
         },
-        .binding.object  = obj->peak.buf,
+        .binding.object  = peak->buf,
         .buffer_vars     = (struct pl_buffer_var *) peak_buf_vars,
         .num_buffer_vars = PL_ARRAY_SIZE(peak_buf_vars),
     });
@@ -1624,6 +1662,100 @@ retry_ssbo:
     return true;
 }
 
+bool pl_shader_detect_peak(pl_shader sh, struct pl_color_space csp,
+                           pl_shader_obj *state,
+                           const struct pl_peak_detect_params *params)
+{
+    params = PL_DEF(params, &pl_peak_detect_default_params);
+    if (!sh_require(sh, PL_SHADER_SIG_COLOR, 0, 0) || !setup_peak_compute(sh, params))
+        return false;
+    struct sh_color_map_obj *obj;
+    obj = SH_OBJ(sh, state, PL_SHADER_OBJ_COLOR_MAP, struct sh_color_map_obj,
+                 sh_color_map_uninit);
+    if (!obj)
+        return false;
+
+    if (sh_peak_params_equal(&obj->peak.buffer.params, params)) {
+        update_peak_buf(SH_GPU(sh), obj, true);
+    } else {
+        pl_reset_detected_peak(*state);
+    }
+    return shader_measure_peak(sh, csp, &obj->peak.buffer, params);
+}
+
+static void peak_measurement_uninit(pl_gpu gpu, void *ptr)
+{
+    struct peak_measurement *measurement = ptr;
+    pl_buf_destroy(gpu, &measurement->buffer.buf);
+    pl_buf_destroy(gpu, &measurement->buffer.readback);
+}
+
+bool sh_measure_peak(pl_shader sh, struct pl_color_space csp,
+                     pl_shader_obj *state,
+                     const struct pl_peak_detect_params *params)
+{
+    params = PL_DEF(params, &pl_peak_detect_default_params);
+    if (!sh_require(sh, PL_SHADER_SIG_COLOR, 0, 0) || !setup_peak_compute(sh, params))
+        return false;
+    struct peak_measurement *measurement;
+    measurement = SH_OBJ(sh, state, PL_SHADER_OBJ_PEAK, struct peak_measurement,
+                         peak_measurement_uninit);
+    if (!measurement)
+        return false;
+    if (measurement->buffer.buf || measurement->ready || measurement->failed) {
+        SH_FAIL(sh, "Peak measurement object already belongs to a source!");
+        return false;
+    }
+    if (!shader_measure_peak(sh, csp, &measurement->buffer, params)) {
+        measurement->failed = true;
+        return false;
+    }
+    return true;
+}
+
+enum sh_peak_status sh_get_peak_measurement(pl_shader_obj state, bool wait,
+                                            struct sh_peak_result *out)
+{
+    struct peak_measurement *measurement = SH_OBJ_LOOKUP(state, PL_SHADER_OBJ_PEAK,
+                                                          struct peak_measurement);
+    if (!measurement || !out)
+        return SH_PEAK_ERROR;
+    if (measurement->failed)
+        return SH_PEAK_ERROR;
+    if (!measurement->ready) {
+        enum sh_peak_status status = read_peak_buffer(state->gpu,
+            &measurement->buffer, wait, &measurement->result);
+        if (status != SH_PEAK_READY) {
+            measurement->failed = status == SH_PEAK_ERROR;
+            return status;
+        }
+        measurement->ready = true;
+    }
+    *out = measurement->result;
+    return SH_PEAK_READY;
+}
+
+bool sh_peak_metadata(const struct sh_peak_result *result,
+                      struct pl_hdr_metadata *out)
+{
+    if (!result->avg_pq)
+        return false;
+    const float scene_avg = pl_hdr_rescale(PL_HDR_PQ, PL_HDR_NITS,
+                                           result->scene_avg_pq);
+    const float scene_max = pl_hdr_rescale(PL_HDR_PQ, PL_HDR_NITS,
+                                           result->scene_max_pq);
+    // max_y_pq is not percentile-bounded, so fallback to maxRGB in case
+    // it has some bogus value, it should be strictly <= maxRGB.
+    // TODO: Resolve this maxRGB vs maxY discrepancy, DV L1 metadata is based on
+    // maxRGB, not maxY. HDR10+ though is maxY. Our API exposes maxY.
+    out->max_pq_y  = PL_MIN(result->max_y_pq, result->max_pq);
+    out->avg_pq_y  = result->avg_pq;
+    out->scene_avg = scene_avg;
+    for (int i = 0; i < PL_ARRAY_SIZE(out->scene_max); i++)
+        out->scene_max[i] = scene_max;
+    return true;
+}
+
 bool pl_get_detected_hdr_metadata(const pl_shader_obj state,
                                   struct pl_hdr_metadata *out)
 {
@@ -1633,22 +1765,22 @@ bool pl_get_detected_hdr_metadata(const pl_shader_obj state,
         return false;
 
     update_peak_buf(state->gpu, obj, false);
-    if (!obj->peak.avg_pq)
-        return false;
+    return sh_peak_metadata(&obj->peak.result, out);
+}
 
-    const float scene_avg = pl_hdr_rescale(PL_HDR_PQ, PL_HDR_NITS,
-                                           obj->peak.scene_avg_pq);
-    const float scene_max = pl_hdr_rescale(PL_HDR_PQ, PL_HDR_NITS,
-                                           obj->peak.scene_max_pq);
-    // peak.max_y_pq is not percentile-bounded, so fallback to maxRGB in case
-    // it has some bogus value, it should be strictly <= maxRGB.
-    // TODO: Resolve this maxRGB vs maxY discrepancy, DV L1 metadata is based on
-    // maxRGB, not maxY. HDR10+ though is maxY. Our API exposes maxY.
-    out->max_pq_y  = PL_MIN(obj->peak.max_y_pq, obj->peak.max_pq);
-    out->avg_pq_y  = obj->peak.avg_pq;
-    out->scene_avg = scene_avg;
-    for (int i = 0; i < PL_ARRAY_SIZE(out->scene_max); i++)
-        out->scene_max[i] = scene_max;
+bool sh_color_map_set_peak(pl_gpu gpu, pl_shader_obj *state,
+                           const struct sh_peak_result *result)
+{
+    struct sh_color_map_obj *obj;
+    obj = sh_alloc_obj(gpu, state, PL_SHADER_OBJ_COLOR_MAP, sizeof(*obj),
+                        sh_color_map_uninit);
+    if (!obj)
+        return false;
+    if (obj->peak.buffer.buf) {
+        PL_ERR(gpu, "Cannot replace a pending peak measurement with a snapshot!");
+        return false;
+    }
+    obj->peak.result = result ? *result : (struct sh_peak_result) {0};
     return true;
 }
 
@@ -1659,10 +1791,10 @@ void pl_reset_detected_peak(pl_shader_obj state)
     if (!obj)
         return;
 
-    pl_buf readback = obj->peak.readback;
-    pl_buf_destroy(state->gpu, &obj->peak.buf);
+    pl_buf readback = obj->peak.buffer.readback;
+    pl_buf_destroy(state->gpu, &obj->peak.buffer.buf);
     memset(&obj->peak, 0, sizeof(obj->peak));
-    obj->peak.readback = readback;
+    obj->peak.buffer.readback = readback;
 }
 
 void pl_shader_extract_features(pl_shader sh, struct pl_color_space csp)
@@ -1935,8 +2067,8 @@ static void fill_gamut_lut(void *data, const struct sh_lut_params *params)
     pl_free(tmp);
 }
 
-void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *params,
-                            const struct pl_color_map_args *args)
+static void color_map(pl_shader sh, const struct pl_color_map_params *params,
+                       const struct pl_color_map_args *args, bool postlinearized)
 {
     if (!sh_require(sh, PL_SHADER_SIG_COLOR, 0, 0))
         return;
@@ -1964,8 +2096,10 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
 
     pl_color_space_infer_map(&src, &dst);
     if (pl_color_space_equal(&src, &dst)) {
-        if (args->prelinearized)
+        if (args->prelinearized && !postlinearized)
             pl_shader_delinearize(sh, &dst);
+        else if (!args->prelinearized && postlinearized)
+            pl_shader_linearize(sh, &dst);
         return;
     }
 
@@ -2221,7 +2355,7 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
     float mclip = PL_CLAMP(params->mastering_clip, 0.0f, 1.0f);
     const float master_nits = args->src.hdr.max_luma;
     if (mclip > 0.0f && master_nits > 0.0f && master_nits < 9999.0f &&
-        obj && obj->peak.max_y_pq > 0.0f)
+        obj && obj->peak.result.max_y_pq > 0.0f)
     {
         // Trust the mastering peak only while the measured scene luminance
         // stays below it; badly mastered content with wrong metadata would
@@ -2230,7 +2364,7 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
         // temporally smoothed, so a scene brightening past the peak (or a
         // fade-in ending above it) cannot toggle the clip on and off.
         const float measured =
-            pl_hdr_rescale(PL_HDR_PQ, PL_HDR_NITS, obj->peak.max_y_pq);
+            pl_hdr_rescale(PL_HDR_PQ, PL_HDR_NITS, obj->peak.result.max_y_pq);
         mclip *= 1.0f - pl_smoothstep(1.1f, 1.4f, measured / master_nits);
     } else {
         mclip = 0.0f;
@@ -2496,8 +2630,21 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
     }
 
 done:
-    pl_shader_delinearize(sh, &dst);
+    if (!postlinearized)
+        pl_shader_delinearize(sh, &dst);
     GLSL("}\n");
+}
+
+void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *params,
+                            const struct pl_color_map_args *args)
+{
+    color_map(sh, params, args, false);
+}
+
+void sh_color_map_to_linear(pl_shader sh, const struct pl_color_map_params *params,
+                            const struct pl_color_map_args *args)
+{
+    color_map(sh, params, args, true);
 }
 
 // Backwards compatibility wrapper around `pl_shader_color_map_ex`
