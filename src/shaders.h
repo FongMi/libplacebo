@@ -265,6 +265,7 @@ enum pl_shader_obj_type {
     PL_SHADER_OBJ_AV1_GRAIN,
     PL_SHADER_OBJ_FILM_GRAIN,
     PL_SHADER_OBJ_RESHAPE,
+    PL_SHADER_OBJ_PEAK,
 };
 
 struct pl_shader_obj_t {
@@ -287,6 +288,55 @@ void *sh_require_obj(pl_shader sh, pl_shader_obj *ptr,
 void *sh_alloc_obj(pl_gpu gpu, pl_shader_obj *ptr,
                    enum pl_shader_obj_type type, size_t priv_size,
                    void (*uninit)(pl_gpu gpu, void *priv));
+
+// Raw per-source peak statistics. PQ fields retain the detector's native
+// quantization; active_ratio is needed by scene-change hysteresis.
+struct sh_peak_result {
+    float avg_pq, max_pq;
+    float scene_avg_pq, scene_max_pq;
+    float max_y_pq;
+    float active_ratio;
+};
+
+enum sh_peak_status {
+    SH_PEAK_ERROR = -1,
+    SH_PEAK_PENDING,
+    SH_PEAK_READY,
+};
+
+struct pl_color_space;
+struct pl_hdr_metadata;
+struct pl_peak_detect_params;
+bool sh_peak_params_equal(const struct pl_peak_detect_params *a,
+                           const struct pl_peak_detect_params *b);
+
+// One-shot measurement, owned by one source record. Destroy the object when
+// that source/measurement policy expires. Retrieval is immutable after READY;
+// it never advances a temporal history. Pending/error leave `out` untouched.
+bool sh_measure_peak(pl_shader sh, struct pl_color_space csp,
+                     pl_shader_obj *state,
+                     const struct pl_peak_detect_params *params);
+enum sh_peak_status sh_get_peak_measurement(pl_shader_obj state, bool wait,
+                                            struct sh_peak_result *out);
+
+// Advance exactly once per source, in source order. A zero history is empty.
+void sh_peak_smooth(struct sh_peak_result *history,
+                    const struct sh_peak_result *sample,
+                    const struct pl_peak_detect_params *params);
+bool sh_peak_metadata(const struct sh_peak_result *result,
+                      struct pl_hdr_metadata *out);
+
+// Select a presentation snapshot without advancing history or discarding
+// pending legacy measurements. NULL selects an empty snapshot.
+bool sh_color_map_set_peak(pl_gpu gpu, pl_shader_obj *state,
+                           const struct sh_peak_result *result);
+
+struct pl_color_map_params;
+struct pl_color_map_args;
+// Keep the target's tone/gamut adaptation, but leave the result in normalized
+// display-linear light instead of applying the target transfer function.
+void sh_color_map_to_linear(pl_shader sh, const struct pl_color_map_params *params,
+                            const struct pl_color_map_args *args);
 
 // Initializes a PRNG. The resulting string will directly evaluate to a
 // pseudorandom, uniformly distributed vec3 from [0.0,1.0). Since this

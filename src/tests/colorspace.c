@@ -43,6 +43,35 @@ static void ycgco_r_to_rgb(float y, float cg, float co, float *r, float *g,
 
 int main()
 {
+    REQUIRE(pl_color_transfer_is_normalized_linear(PL_COLOR_TRC_LINEAR));
+    REQUIRE(pl_color_transfer_is_normalized_linear(PL_COLOR_TRC_LINEAR_HDR));
+    REQUIRE(!pl_color_transfer_is_normalized_linear(PL_COLOR_TRC_SCRGB));
+    const float peaks[] = {20, 203, 204, 1000};
+    for (int i = 0; i < PL_ARRAY_SIZE(peaks); i++) {
+        struct pl_color_space hdr = {
+            .primaries = PL_COLOR_PRIM_BT_2020,
+            .transfer = PL_COLOR_TRC_LINEAR_HDR,
+            .hdr.min_luma = 0.005f,
+            .hdr.max_luma = peaks[i],
+        };
+        REQUIRE(pl_color_space_is_hdr(&hdr));
+        REQUIRE(!pl_color_space_is_black_scaled(&hdr));
+        const float values[][3] = {{-0.25f, 0, 1}, {2, 10, 100}};
+        for (int j = 0; j < PL_ARRAY_SIZE(values); j++) {
+            float color[3];
+            memcpy(color, values[j], sizeof(color));
+            pl_color_linearize(&hdr, color);
+            REQUIRE(!memcmp(color, values[j], sizeof(color)));
+            pl_color_delinearize(&hdr, color);
+            REQUIRE(!memcmp(color, values[j], sizeof(color)));
+        }
+        struct pl_color_space pq = hdr;
+        pq.transfer = PL_COLOR_TRC_PQ;
+        struct pl_color_space hdr_target = {0}, pq_target = {0};
+        pl_color_space_infer_map(&hdr, &hdr_target);
+        pl_color_space_infer_map(&pq, &pq_target);
+        REQUIRE(pl_color_space_equal(&hdr_target, &pq_target));
+    }
     for (enum pl_color_system sys = 0; sys < PL_COLOR_SYSTEM_COUNT; sys++) {
         bool ycbcr = sys >= PL_COLOR_SYSTEM_BT_601 && sys <= PL_COLOR_SYSTEM_YCGCO_RO;
         REQUIRE_CMP(ycbcr, ==, pl_color_system_is_ycbcr_like(sys), "d");

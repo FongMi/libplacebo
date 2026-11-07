@@ -564,14 +564,19 @@ static void pl_shader_tests(pl_gpu gpu)
         };
         sh = pl_dispatch_begin(dp);
         pl_shader_sample_nearest(sh, pl_sample_src( .tex = src ));
+        if (trc == PL_COLOR_TRC_LINEAR_HDR)
+            GLSL("color.rgb = color.rgb * 100.0 - 25.0; \n");
         pl_shader_delinearize(sh, &test_csp);
         pl_shader_linearize(sh, &test_csp);
+        if (trc == PL_COLOR_TRC_LINEAR_HDR)
+            GLSL("color.rgb = (color.rgb + 25.0) / 100.0; \n");
         REQUIRE(pl_dispatch_finish(dp, pl_dispatch_params(
             .shader = &sh,
             .target = fbo,
         )));
 
-        float epsilon = pl_color_transfer_is_hdr(trc) ? 1e-4 : 1e-6;
+        float epsilon = pl_color_transfer_is_normalized_linear(trc) ? 1e-6 :
+                        pl_color_transfer_is_hdr(trc) ? 1e-4 : 1e-6;
         TEST_FBO_PATTERN(epsilon, "transfer function: %s", pl_color_transfer_name(trc));
     }
 
@@ -1183,6 +1188,100 @@ static void render_info_cb(void *priv, const struct pl_render_info *info)
     REQUIRE(info->pass->shader->description);
 }
 
+static void peak_alpha_tests(pl_gpu gpu, enum pl_color_primaries primaries)
+{
+    pl_fmt fmt = pl_find_fmt(gpu, PL_FMT_FLOAT, 4, 32, 32,
+                             PL_FMT_CAP_SAMPLEABLE | PL_FMT_CAP_RENDERABLE |
+                             PL_FMT_CAP_HOST_READABLE);
+    if (!fmt || !gpu->limits.max_ssbo_size)
+        return;
+    float pixels[16 * 16 * 4], output[16 * 16 * 4];
+    pl_tex texture = pl_tex_create(gpu, pl_tex_params(
+        .w = 16, .h = 16, .format = fmt,
+        .sampleable = true, .host_writable = true));
+    pl_tex target = NULL;
+    REQUIRE(texture);
+    struct pl_color_space pq = pl_color_space_hdr10;
+    pq.primaries = primaries;
+    pq.hdr.prim = *pl_raw_primaries_get(primaries);
+    pq.hdr.max_luma = 1000;
+    pq.hdr.min_luma = 0.005f;
+    const float codes[] = {0.7f, 0.5f, 0.3f};
+    float linear[3];
+    memcpy(linear, codes, sizeof(linear));
+    pl_color_linearize(&pq, linear);
+    const float alphas[] = {0, 0.5f, 1};
+    for (int mode = 0; mode < 3; mode++) {
+        int size = mode ? 8 : 16;
+        REQUIRE(pl_tex_recreate(gpu, &target, pl_tex_params(
+            .w = size, .h = size, .format = fmt,
+            .renderable = true, .host_readable = true)));
+        for (int a = 0; a < PL_ARRAY_SIZE(alphas); a++) {
+            struct pl_hdr_metadata reference = {0};
+            for (int variant = 0; variant < 6; variant++) {
+                bool premultiplied = variant & 1;
+                bool is_linear = variant >= 2;
+                bool absolute = variant >= 4;
+                for (int i = 0; i < 16 * 16; i++) {
+                    for (int c = 0; c < 3; c++) {
+                        float value = is_linear ? linear[c] : codes[c];
+                        pixels[i * 4 + c] = premultiplied ? value * alphas[a] : value;
+                    }
+                    pixels[i * 4 + 3] = alphas[a];
+                }
+                REQUIRE(pl_tex_upload(gpu, pl_tex_transfer_params(
+                    .tex = texture, .ptr = pixels)));
+                struct pl_frame image = {
+                    .num_planes = 1,
+                    .planes[0] = {
+                        .texture = texture, .components = 4,
+                        .component_mapping = {0, 1, 2, 3},
+                    },
+                    .repr = pl_color_repr_rgb, .color = pq,
+                };
+                image.repr.alpha = premultiplied ? PL_ALPHA_PREMULTIPLIED
+                                                 : PL_ALPHA_INDEPENDENT;
+                if (is_linear)
+                    image.color.transfer = absolute ? PL_COLOR_TRC_LINEAR_HDR
+                                                     : PL_COLOR_TRC_LINEAR;
+                struct pl_frame destination = image;
+                destination.planes[0].texture = target;
+                destination.repr = pl_color_repr_rgb;
+                destination.color = pl_color_space_bt709;
+                struct pl_render_params params = pl_render_default_params;
+                params.disable_linear_scaling = mode == 2;
+                params.peak_detect_params = pl_peak_detect_params(.allow_delayed = false);
+                pl_renderer rr = pl_renderer_create(gpu->log, gpu);
+                REQUIRE(rr);
+                REQUIRE(pl_render_image(rr, &image, &destination, &params));
+                REQUIRE(pl_tex_download(gpu, pl_tex_transfer_params(
+                    .tex = target, .ptr = output)));
+                struct pl_hdr_metadata detected = {0};
+                bool measured = pl_renderer_get_hdr_metadata(rr, &detected);
+                printf("- peak alpha mode=%d alpha=%.1f variant=%d measured=%d\n",
+                       mode, alphas[a], variant, measured);
+                fflush(stdout);
+                if (alphas[a] > 0) {
+                    REQUIRE(measured);
+                    if (!variant)
+                        reference = detected;
+                    REQUIRE(fabsf(detected.max_pq_y - reference.max_pq_y) < 0.001f);
+                    REQUIRE(fabsf(detected.avg_pq_y - reference.avg_pq_y) < 0.001f);
+                }
+                for (int i = 0; i < size * size * 4; i++) {
+                    REQUIRE(isfinite(output[i]));
+                    if (!alphas[a] && i % 4 != 3)
+                        REQUIRE(fabsf(output[i]) < 0.0001f);
+                }
+                REQUIRE(pl_renderer_get_errors(rr).errors == PL_RENDER_ERR_NONE);
+                pl_renderer_destroy(&rr);
+            }
+        }
+    }
+    pl_tex_destroy(gpu, &texture);
+    pl_tex_destroy(gpu, &target);
+}
+
 static void pl_render_tests(pl_gpu gpu)
 {
     pl_tex img_tex = NULL, fbo = NULL;
@@ -1314,10 +1413,36 @@ static void pl_render_tests(pl_gpu gpu)
     REQUIRE(pl_renderer_get_errors(rr).errors == PL_RENDER_ERR_NONE);
 
     // Test HDR tone mapping
+    peak_alpha_tests(gpu, PL_COLOR_PRIM_BT_2020);
+    peak_alpha_tests(gpu, PL_COLOR_PRIM_DISPLAY_P3);
     image.color = pl_color_space_hdr10;
     TEST_PARAMS(color_map, visualize_lut, true);
     if (gpu->limits.max_ssbo_size)
         TEST_PARAMS(peak_detect, allow_delayed, true);
+
+    // A linear HDR frame can exceed nominal white, independently of its
+    // mastering display. Peak detection must not infer a 203 nit upper bound.
+    if (gpu->limits.max_ssbo_size) {
+        const float targets[] = {203, 1000, 4000};
+        struct pl_render_params peak_params = pl_render_default_params;
+        peak_params.peak_detect_params = pl_peak_detect_params(.allow_delayed = false);
+        struct pl_frame linear = image;
+        linear.color.transfer = PL_COLOR_TRC_LINEAR;
+        linear.color.hdr.max_luma = 1000;
+        for (int i = 0; i < PL_ARRAY_SIZE(targets); i++) {
+            struct pl_frame output = target;
+            output.color.hdr.max_luma = targets[i];
+            pl_renderer detector = pl_renderer_create(gpu->log, gpu);
+            REQUIRE(detector);
+            REQUIRE(pl_render_image(detector, &linear, &output, &peak_params));
+            pl_gpu_finish(gpu);
+            struct pl_hdr_metadata detected = {0};
+            REQUIRE(pl_renderer_get_hdr_metadata(detector, &detected));
+            REQUIRE(detected.max_pq_y > 0 && detected.avg_pq_y > 0);
+            REQUIRE(pl_renderer_get_errors(detector).errors == PL_RENDER_ERR_NONE);
+            pl_renderer_destroy(&detector);
+        }
+    }
 
     // Test inverse tone-mapping and pure BPC
     image.color.hdr.max_luma = 1000;
@@ -1345,6 +1470,34 @@ static void pl_render_tests(pl_gpu gpu)
     pl_frames_infer(rr, &inferred_image, &inferred_target);
     REQUIRE(pl_render_image(rr, &inferred_image, &inferred_target, &params));
     REQUIRE(pl_renderer_get_errors(rr).errors == PL_RENDER_ERR_NONE);
+
+    // DV reconstruction defines the decoded color space, independently of
+    // transport tags. Inferring it must preserve authored luminance metadata.
+    const enum pl_color_primaries dv_prim[] = {
+        PL_COLOR_PRIM_UNKNOWN, PL_COLOR_PRIM_BT_709, PL_COLOR_PRIM_DCI_P3,
+    };
+    const enum pl_color_transfer dv_trc[] = {
+        PL_COLOR_TRC_UNKNOWN, PL_COLOR_TRC_SRGB, PL_COLOR_TRC_PQ,
+    };
+    for (int p = 0; p < PL_ARRAY_SIZE(dv_prim); p++) {
+        for (int t = 0; t < PL_ARRAY_SIZE(dv_trc); t++) {
+            struct pl_frame dv = image, output = target;
+            dv.repr.sys = PL_COLOR_SYSTEM_DOLBYVISION;
+            dv.color = pl_color_space_hdr10;
+            dv.color.primaries = dv_prim[p];
+            dv.color.transfer = dv_trc[t];
+            dv.color.hdr.prim = *pl_raw_primaries_get(PL_COLOR_PRIM_BT_2020);
+            dv.color.hdr.min_luma = 0.005f;
+            dv.color.hdr.max_luma = 1000;
+            dv.color.hdr.max_pq_y = 0.75f;
+            dv.color.hdr.avg_pq_y = 0.5f;
+            struct pl_hdr_metadata original = dv.color.hdr;
+            pl_frames_infer(rr, &dv, &output);
+            REQUIRE(dv.color.primaries == PL_COLOR_PRIM_BT_2020);
+            REQUIRE(dv.color.transfer == PL_COLOR_TRC_PQ);
+            REQUIRE(pl_hdr_metadata_equal(&dv.color.hdr, &original));
+        }
+    }
 
     // Test background blending and alpha transparency
     params.blend_against_tiles = true;
@@ -2366,6 +2519,77 @@ static void pl_test_host_ptr(pl_gpu gpu)
 #endif // unix
 }
 
+static void pl_render_sampling_tests(pl_gpu gpu)
+{
+    pl_fmt fmt = pl_find_fmt(gpu, PL_FMT_FLOAT, 4, 16, 16,
+        PL_FMT_CAP_SAMPLEABLE | PL_FMT_CAP_LINEAR | PL_FMT_CAP_RENDERABLE |
+        PL_FMT_CAP_HOST_READABLE);
+    if (!fmt)
+        return;
+
+    enum { W = 128, H = 96 };
+    uint16_t data[W * H * 4], out[W * H * 4];
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            for (int c = 0; c < 3; c++)
+                data[(y * W + x) * 4 + c] = (x + y + c) % 2 ? 0x3c00 : 0;
+            data[(y * W + x) * 4 + 3] = 0x3c00;
+        }
+    }
+
+    pl_tex src = pl_tex_create(gpu, pl_tex_params(
+        .w = W, .h = H, .format = fmt, .sampleable = true, .initial_data = data,
+    ));
+    pl_tex dst = NULL;
+    REQUIRE(src);
+    pl_renderer rr = pl_renderer_create(gpu->log, gpu);
+    for (int test = 0; test < 4; test++) {
+        const bool cropped = test == 1 || test == 2;
+        const int width = cropped ? 64 : test == 3 ? W / 2 : W;
+        const int height = cropped ? 64 : test == 3 ? H / 2 : H;
+        const float offset = test == 2 ? 0.25f : 0.0f;
+        printf("- testing float sampling, case %d, offset %.2f\n", test, offset);
+        REQUIRE(pl_tex_recreate(gpu, &dst, pl_tex_params(
+            .w = width, .h = height, .format = fmt,
+            .renderable = true, .host_readable = true,
+        )));
+        struct pl_frame image = {
+            .num_planes = 1,
+            .planes[0] = { .texture = src, .components = 4,
+                           .component_mapping = {0, 1, 2, 3} },
+            .repr = pl_color_repr_rgb,
+            .color = pl_color_space_bt709,
+            .crop = { cropped ? 32 + offset : 0, cropped ? 16 + offset : 0,
+                      cropped ? 96 + offset : W, cropped ? 80 + offset : H },
+        };
+        image.color.transfer = PL_COLOR_TRC_GAMMA22;
+        struct pl_frame target = image;
+        target.planes[0].texture = dst;
+        target.crop = (pl_rect2df) { 0, 0, width, height };
+        struct pl_render_params params = pl_render_fast_params;
+        params.upscaler = &pl_filter_bilinear;
+        params.correct_subpixel_offsets = true;
+        REQUIRE(pl_render_image(rr, &image, &target, &params));
+        REQUIRE(pl_tex_download(gpu, pl_tex_transfer_params(.tex = dst, .ptr = out)));
+        for (int y = 0; y < height - (test == 2); y++) {
+            for (int x = 0; x < width - (test == 2); x++) {
+                for (int c = 0; c < 4; c++) {
+                    uint16_t expect = c == 3 || (x + y + c) % 2 ? 0x3c00 : 0;
+                    if (test == 2 && c != 3)
+                        expect = expect ? 0x3900 : 0x3600; // 0.625 or 0.375
+                    if (test == 3 && c != 3)
+                        expect = 0x3800; // 0.5
+                    REQUIRE_CMP(out[(y * width + x) * 4 + c], ==, expect, "u");
+                }
+            }
+        }
+        REQUIRE(pl_renderer_get_errors(rr).errors == PL_RENDER_ERR_NONE);
+    }
+    pl_renderer_destroy(&rr);
+    pl_tex_destroy(gpu, &src);
+    pl_tex_destroy(gpu, &dst);
+}
+
 // At 1:1 scale, the renderer drops sub-pixel offsets from the source crop,
 // so these must round to the nearest pixel. In particular, float error just
 // below a whole pixel must not shift the image by an entire pixel.
@@ -2933,6 +3157,2240 @@ static void pl_dovi_tests(pl_gpu gpu)
 
 #endif // PL_HAVE_DOVI
 
+struct custom_mix_test {
+    pl_gpu gpu;
+    pl_dispatch dispatch;
+    pl_tex output;
+    int calls, count, reference;
+    const double *timestamps;
+    uint64_t ids[16];
+    float alpha;
+    bool fail, blend, verify_clean;
+    struct pl_color_space encoded;
+};
+
+static pl_tex custom_mix_callback(void *priv, const struct pl_rendered_mix *mix)
+{
+    struct custom_mix_test *test = priv;
+    test->calls++;
+    REQUIRE(mix->num_frames == test->count);
+    REQUIRE(mix->reference == test->reference);
+    REQUIRE(pl_color_transfer_is_normalized_linear(mix->color.transfer));
+    for (int i = 0; i < mix->num_frames; i++) {
+        const struct pl_rendered_frame *frame = &mix->frames[i];
+        REQUIRE(frame->timestamp == test->timestamps[i]);
+        REQUIRE(frame->signature);
+        REQUIRE(frame->texture->params.format->type == PL_FMT_FLOAT);
+        REQUIRE(frame->texture->params.format->num_components == 4);
+        for (int c = 0; c < 4; c++)
+            REQUIRE(frame->texture->params.format->component_depth[c] == 32);
+        test->ids[i] = frame->signature;
+    }
+    if (test->fail)
+        return NULL;
+    if (test->verify_clean) {
+        pl_tex ref = mix->frames[test->reference].texture;
+        REQUIRE(pl_tex_recreate(test->gpu, &test->output, pl_tex_params(
+            .w = ref->params.w, .h = ref->params.h, .format = ref->params.format,
+            .sampleable = true, .renderable = true, .host_readable = true)));
+        pl_shader copy = pl_dispatch_begin(test->dispatch);
+        REQUIRE(pl_shader_sample_direct(copy, pl_sample_src(.tex = ref)));
+        REQUIRE(pl_dispatch_finish(test->dispatch, pl_dispatch_params(
+            .shader = &copy, .target = test->output)));
+        size_t count = (size_t) ref->params.w * ref->params.h;
+        float *data = malloc(count * 4 * sizeof(float));
+        REQUIRE(data);
+        REQUIRE(pl_tex_download(test->gpu, pl_tex_transfer_params(
+            .tex = test->output, .ptr = data)));
+        for (size_t i = 0; i < count; i++) {
+            float rgb[] = {0.2f + 0.01f * (i % ref->params.w), 0.3f, 0.4f};
+            pl_color_linearize(&test->encoded, rgb);
+            for (int c = 0; c < 3; c++)
+                REQUIRE(fabsf(data[4*i+c] - rgb[c] * 0.75f) < 0.0001f);
+            REQUIRE(fabsf(data[4*i+3] - 0.75f) < 0.000001f);
+        }
+        free(data);
+    }
+    if (!test->blend)
+        return mix->frames[test->reference].texture;
+
+    pl_tex first = mix->frames[0].texture;
+    REQUIRE(pl_tex_recreate(test->gpu, &test->output, pl_tex_params(
+        .w = first->params.w, .h = first->params.h,
+        .format = first->params.format, .sampleable = true, .renderable = true)));
+    struct pl_shader_desc desc[2] = {0};
+    for (int i = 0; i < 2; i++) {
+        desc[i].desc = (struct pl_desc) {
+            .name = i ? "second" : "first", .type = PL_DESC_SAMPLED_TEX,
+        };
+        desc[i].binding.object = mix->frames[i].texture;
+        desc[i].binding.sample_mode = PL_TEX_SAMPLE_NEAREST;
+        desc[i].binding.address_mode = PL_TEX_ADDRESS_CLAMP;
+    }
+    pl_shader sh = pl_dispatch_begin(test->dispatch);
+    REQUIRE(pl_shader_custom(sh, &(struct pl_custom_shader) {
+        .input = PL_SHADER_SIG_NONE, .output = PL_SHADER_SIG_COLOR,
+        .body = "ivec2 p = ivec2(gl_FragCoord.xy);\n"
+                "color = mix(texelFetch(first, p, 0), "
+                "texelFetch(second, p, 0), alpha);\n",
+        .descriptors = desc, .num_descriptors = 2,
+        .variables = &(struct pl_shader_var) {
+            .var = pl_var_float("alpha"), .data = &test->alpha,
+        },
+        .num_variables = 1,
+    }));
+    REQUIRE(pl_dispatch_finish(test->dispatch, pl_dispatch_params(
+        .shader = &sh, .target = test->output)));
+    return test->output;
+}
+
+static struct pl_frame custom_mix_frame(pl_tex texture)
+{
+    return (struct pl_frame) {
+        .num_planes = 1,
+        .planes[0] = {
+            .texture = texture, .components = 4,
+            .component_mapping = {0, 1, 2, 3},
+        },
+        .repr = {.sys = PL_COLOR_SYSTEM_RGB, .levels = PL_COLOR_LEVELS_FULL,
+                 .alpha = PL_ALPHA_INDEPENDENT},
+        .color = {
+            .primaries = PL_COLOR_PRIM_BT_709, .transfer = PL_COLOR_TRC_GAMMA22,
+            .hdr = {.min_luma = 0.1f, .max_luma = 203},
+        },
+    };
+}
+
+static void custom_mix_download(pl_gpu gpu, pl_tex texture, float *data)
+{
+    REQUIRE(pl_tex_download(gpu, pl_tex_transfer_params(
+        .tex = texture, .ptr = data)));
+}
+
+static void custom_mix_compare(const float *actual, const float *expected, int n)
+{
+    for (int i = 0; i < n; i++) {
+        if (!isfinite(actual[i]) || !isfinite(expected[i]) ||
+            !(fabsf(actual[i] - expected[i]) < 0.003f))
+        {
+            printf("custom mix mismatch index=%d actual=%.9g expected=%.9g "
+                   "error=%.9g\n", i, actual[i], expected[i],
+                   fabsf(actual[i] - expected[i]));
+            fflush(stdout);
+        }
+        REQUIRE(isfinite(actual[i]) && isfinite(expected[i]));
+        REQUIRE(fabsf(actual[i] - expected[i]) < 0.003f);
+    }
+}
+
+struct custom_mix_owner {
+    int acquired, released;
+    bool active, set_crop, fail;
+    pl_rect2df crop;
+    struct pl_overlay *overlay;
+    pl_tex overlay_texture;
+};
+
+static bool custom_mix_acquire(pl_gpu gpu, struct pl_frame *frame)
+{
+    (void) gpu;
+    struct custom_mix_owner *owner = frame->user_data;
+    REQUIRE(!owner->active);
+    owner->active = true;
+    owner->acquired++;
+    if (owner->set_crop)
+        frame->crop = owner->crop;
+    if (owner->overlay) {
+        owner->overlay->tex = owner->overlay_texture;
+        frame->overlays = owner->overlay;
+        frame->num_overlays = 1;
+    }
+    return !owner->fail;
+}
+
+static void custom_mix_release(pl_gpu gpu, struct pl_frame *frame)
+{
+    (void) gpu;
+    struct custom_mix_owner *owner = frame->user_data;
+    REQUIRE(owner->active);
+    owner->active = false;
+    owner->released++;
+    if (owner->overlay)
+        owner->overlay->tex = NULL;
+    frame->overlays = NULL;
+    frame->num_overlays = 0;
+}
+
+enum { SH_W = 32, SH_H = 32, SH_N = SH_W * SH_H * 4 };
+struct source_hook_test;
+struct source_hook_owner {
+    struct source_hook_test *p;
+    float pts;
+    int acquired, released;
+};
+struct source_hook_test {
+    pl_gpu gpu;
+    pl_renderer rr, oracle;
+    pl_dispatch dp;
+    pl_tex readback, expected;
+    const struct pl_hook *hook, *oracle_hook;
+    struct pl_frame sources[3];
+    struct source_hook_owner owners[3];
+    struct pl_render_params params;
+    uint64_t ids[2];
+    int base, frame0, calls;
+    float alpha, gain;
+};
+
+static void source_hook_parameter(const struct pl_hook *hook, const char *name, float value)
+{
+    for (int i = 0; i < hook->num_parameters; i++) {
+        if (!strcmp(hook->parameters[i].name, name)) {
+            REQUIRE(hook->parameters[i].type == PL_VAR_FLOAT);
+            hook->parameters[i].data->f = value;
+            return;
+        }
+    }
+    REQUIRE(false);
+}
+
+static bool source_hook_acquire(pl_gpu gpu, struct pl_frame *frame)
+{
+    (void) gpu;
+    struct source_hook_owner *o = frame->user_data;
+    o->acquired++;
+    source_hook_parameter(o->p->hook, "PTS", o->pts);
+    return true;
+}
+
+static void source_hook_release(pl_gpu gpu, struct pl_frame *frame)
+{
+    (void) gpu;
+    struct source_hook_owner *o = frame->user_data;
+    o->released++;
+}
+
+static void source_hook_info(void *priv, const struct pl_render_info *event)
+{
+    struct source_hook_test *p = priv;
+    if (event->stage == PL_RENDER_STAGE_FRAME && event->index == 0)
+        p->frame0++;
+}
+
+static struct pl_frame source_hook_frame(pl_tex texture)
+{
+    return (struct pl_frame) {
+        .num_planes = 1,
+        .planes[0] = {.texture = texture, .components = 4,
+                     .component_mapping = {0, 1, 2, 3}},
+        .repr = {.sys = PL_COLOR_SYSTEM_RGB, .levels = PL_COLOR_LEVELS_FULL,
+                 .alpha = PL_ALPHA_PREMULTIPLIED},
+        .color = {.primaries = PL_COLOR_PRIM_BT_709,
+                  .transfer = PL_COLOR_TRC_LINEAR_HDR,
+                  .hdr = {.min_luma = 0, .max_luma = 203}},
+    };
+}
+
+static pl_tex source_hook_mix(void *priv, const struct pl_rendered_mix *views)
+{
+    struct source_hook_test *p = priv;
+    REQUIRE(views->num_frames == 2);
+    p->calls++;
+    for (int i = 0; i < 2; i++) {
+        p->ids[i] = views->frames[i].signature;
+        REQUIRE(p->ids[i]);
+        // Separate renderer and separately parsed parameter storage: the oracle
+        // cannot mutate entry/acquire parameter values of the measured renderer.
+        struct pl_frame source = p->sources[p->base + i];
+        source.acquire = NULL;
+        source.release = NULL;
+        source_hook_parameter(p->oracle_hook, "PTS", p->owners[p->base + i].pts);
+        source_hook_parameter(p->oracle_hook, "gain", p->gain);
+        struct pl_frame target = source_hook_frame(p->expected);
+        target.color = views->color;
+        struct pl_render_params params = p->params;
+        params.hooks = &p->oracle_hook;
+        params.num_hooks = 1;
+        params.source_parameters = NULL;
+        params.num_source_parameters = 0;
+        params.info_callback = NULL;
+        params.info_priv = NULL;
+        REQUIRE(pl_render_image(p->oracle, &source, &target, &params));
+        pl_shader sh = pl_dispatch_begin(p->dp);
+        REQUIRE(pl_shader_sample_direct(sh, pl_sample_src(.tex = views->frames[i].texture)));
+        REQUIRE(pl_dispatch_finish(p->dp, pl_dispatch_params(
+            .shader = &sh, .target = p->readback)));
+        float actual[SH_N], expected[SH_N];
+        REQUIRE(pl_tex_download(p->gpu, pl_tex_transfer_params(
+            .tex = p->readback, .ptr = actual)));
+        REQUIRE(pl_tex_download(p->gpu, pl_tex_transfer_params(
+            .tex = p->expected, .ptr = expected)));
+        float maximum = 0;
+        for (int c = 0; c < SH_N; c++) {
+            REQUIRE(isfinite(actual[c]) && isfinite(expected[c]));
+            maximum = fmaxf(maximum, fabsf(actual[c] - expected[c]));
+        }
+        printf("- source hook oracle source=%d max=%.9g\n", p->base + i, maximum);
+        REQUIRE(maximum < .003f);
+        if (i == 1) {
+            // Prove this oracle detects using entry-current PTS for source B/C.
+            source_hook_parameter(p->oracle_hook, "PTS", p->owners[p->base].pts);
+            REQUIRE(pl_render_image(p->oracle, &source, &target, &params));
+            float wrong[SH_N], difference = 0;
+            REQUIRE(pl_tex_download(p->gpu, pl_tex_transfer_params(
+                .tex = p->expected, .ptr = wrong)));
+            for (int c = 0; c < SH_N; c++) {
+                REQUIRE(isfinite(wrong[c]));
+                difference = fmaxf(difference, fabsf(expected[c] - wrong[c]));
+            }
+            printf("wrong-PTS precondition difference=%.9g\n", difference);
+            REQUIRE(difference > .003f);
+        }
+    }
+    return views->frames[views->reference].texture;
+}
+
+static void source_hook_tests(pl_gpu gpu, pl_fmt fmt)
+{
+    static const char shader[] =
+        "//!PARAM gain\n//!TYPE DYNAMIC float\n"
+        "//!MINIMUM 0\n//!MAXIMUM 1\n1\n"
+        "//!PARAM PTS\n//!TYPE DYNAMIC float\n"
+        "//!MINIMUM 0\n//!MAXIMUM 1\n0\n"
+        "//!HOOK MAIN\n//!BIND HOOKED\n"
+        "vec4 hook() {\n"
+        "    vec4 color = HOOKED_texOff(0);\n"
+        "    color.rgb *= gain + PTS * 0.5;\n"
+        "    return color;\n"
+        "}\n";
+    struct source_hook_test p = {.gpu = gpu, .gain = 1};
+    p.rr = pl_renderer_create(gpu->log, gpu);
+    p.oracle = pl_renderer_create(gpu->log, gpu);
+    p.dp = pl_dispatch_create(gpu->log, gpu);
+    p.hook = pl_mpv_user_shader_parse(gpu, shader, strlen(shader));
+    p.oracle_hook = pl_mpv_user_shader_parse(gpu, shader, strlen(shader));
+    REQUIRE(p.rr && p.oracle && p.dp && p.hook && p.oracle_hook);
+    REQUIRE(p.hook->num_parameters == 2);
+    float pixels[SH_N];
+    for (int i = 0; i < SH_W*SH_H; i++) {
+        pixels[i*4] = .1f + (float)(i % 7) * .005f;
+        pixels[i*4+1] = .15f;
+        pixels[i*4+2] = .2f;
+        pixels[i*4+3] = 1;
+    }
+    pl_tex tex[6] = {0};
+    for (int i = 0; i < 6; i++) {
+        tex[i] = pl_tex_create(gpu, pl_tex_params(
+            .w = SH_W, .h = SH_H, .format = fmt, .sampleable = true,
+            .renderable = true, .host_readable = true,
+            .initial_data = i < 3 ? pixels : NULL));
+        REQUIRE(tex[i]);
+    }
+    p.readback = tex[4];
+    p.expected = tex[5];
+    for (int i = 0; i < 3; i++) {
+        p.owners[i] = (struct source_hook_owner){.p = &p, .pts = .1f * (float)(i+1)};
+        p.sources[i] = source_hook_frame(tex[i]);
+        p.sources[i].acquire = source_hook_acquire;
+        p.sources[i].release = source_hook_release;
+        p.sources[i].user_data = &p.owners[i];
+    }
+    struct pl_frame target = source_hook_frame(tex[3]);
+    p.params = pl_render_default_params;
+    p.params.peak_detect_params = NULL;
+    p.params.frame_mixer = NULL;
+    p.params.dither_params = NULL;
+    const char output_shader[] =
+        "//!PARAM output_gain\n//!TYPE DYNAMIC float\n"
+        "//!MINIMUM 0\n//!MAXIMUM 1\n1\n"
+        "//!HOOK OUTPUT\n//!BIND HOOKED\n"
+        "vec4 hook() { return HOOKED_texOff(0) * output_gain; }\n";
+    const struct pl_hook *output_hook = pl_mpv_user_shader_parse(
+        gpu, output_shader, sizeof(output_shader) - 1);
+    REQUIRE(output_hook && output_hook->num_parameters == 1);
+    const struct pl_hook *hooks[] = {p.hook, output_hook};
+    p.params.hooks = hooks;
+    p.params.num_hooks = 2;
+    const struct pl_hook_par *pts_par = NULL;
+    for (int i = 0; i < p.hook->num_parameters; i++) {
+        if (!strcmp(p.hook->parameters[i].name, "PTS"))
+            pts_par = &p.hook->parameters[i];
+    }
+    REQUIRE(pts_par);
+    const struct pl_hook_par *bindings[] = {pts_par, &output_hook->parameters[0]};
+    const struct pl_hook_par *duplicates[] = {
+        &output_hook->parameters[0], pts_par, pts_par,
+    };
+    p.params.source_parameters = bindings;
+    p.params.num_source_parameters = PL_ARRAY_SIZE(bindings);
+    p.params.info_callback = source_hook_info;
+    p.params.info_priv = &p;
+    struct pl_custom_frame_mixer mixer = {.priv = &p, .mix = source_hook_mix};
+    uint64_t overlap = 0, previous[2] = {0};
+    for (int step = 0; step < 12; step++) {
+        p.base = step < 3 ? 0 : 1;
+        p.alpha = .25f * (float)((step % 3) + 1);
+        if (step >= 6) {
+            p.alpha = .5f;
+            p.gain = .5f;
+        }
+        source_hook_parameter(p.hook, "PTS", p.owners[p.base].pts);
+        source_hook_parameter(p.hook, "gain", p.gain);
+        const struct pl_frame *sources[] = {&p.sources[p.base], &p.sources[p.base+1]};
+        uint64_t signatures[] = {(uint64_t)p.base+1, (uint64_t)p.base+2};
+        double timestamps[] = {-p.alpha, 1.0-p.alpha};
+        struct pl_frame_mix input = {.num_frames = 2, .frames = sources,
+            .signatures = signatures, .timestamps = timestamps, .vsync_duration = .2f};
+        if (step == 8) {
+            p.params.source_parameters = duplicates;
+            p.params.num_source_parameters = PL_ARRAY_SIZE(duplicates);
+        } else if (step == 9) {
+            // OUTPUT-only membership/value changes do not affect prepared views.
+            p.params.source_parameters = bindings;
+            p.params.num_source_parameters = 1;
+            source_hook_parameter(output_hook, "output_gain", .5f);
+        } else if (step == 10) {
+            p.params.source_parameters = NULL;
+            p.params.num_source_parameters = 0;
+        } else if (step == 11) {
+            p.params.source_parameters = bindings;
+            p.params.num_source_parameters = PL_ARRAY_SIZE(bindings);
+        }
+        int before = p.frame0;
+        REQUIRE(pl_render_image_mix_custom(p.rr, &input, &target, &p.params, &mixer));
+        printf("- source hook step=%d prepared=%d\n", step, p.frame0 - before);
+        int expected_prepares = step == 0 || step == 6 || step >= 10 ? 2 :
+                                step == 3 ? 1 : 0;
+        REQUIRE(p.frame0 - before == expected_prepares);
+        if (step == 1 || step == 2 || step == 4 || step == 5 ||
+            step == 7 || step == 8 || step == 9)
+            REQUIRE(previous[0] == p.ids[0] && previous[1] == p.ids[1]);
+        if (step == 2)
+            overlap = p.ids[1];
+        if (step == 3)
+            REQUIRE(overlap == p.ids[0]);
+        if (step == 6 || step >= 10)
+            REQUIRE(previous[0] != p.ids[0] && previous[1] != p.ids[1]);
+        memcpy(previous, p.ids, sizeof(previous));
+    }
+    REQUIRE(p.calls == 12);
+    // Malformed lists must fail before any native acquire or mixer callback.
+    struct pl_hook_par unrelated = *pts_par;
+    const struct pl_hook_par *unknown[] = {&unrelated};
+    const struct pl_hook_par *null_entry[] = {NULL};
+    const struct pl_frame *frames[] = {&p.sources[1], &p.sources[2]};
+    uint64_t signatures[] = {2, 3};
+    double timestamps[] = {-.5, .5};
+    struct pl_frame_mix input = {.num_frames = 2, .frames = frames,
+        .signatures = signatures, .timestamps = timestamps, .vsync_duration = .2f};
+    int acquired = 0;
+    for (int i = 0; i < 3; i++)
+        acquired += p.owners[i].acquired;
+    for (int invalid = 0; invalid < 4; invalid++) {
+        p.params.source_parameters = invalid == 0 ? bindings :
+            invalid == 1 ? NULL : invalid == 2 ? unknown : null_entry;
+        p.params.num_source_parameters = invalid == 0 ? -1 : 1;
+        REQUIRE(!pl_render_image_mix_custom(p.rr, &input, &target, &p.params, &mixer));
+        REQUIRE(p.calls == 12);
+        int after = 0;
+        for (int i = 0; i < 3; i++)
+            after += p.owners[i].acquired;
+        REQUIRE(after == acquired);
+    }
+    for (int i = 0; i < 3; i++) {
+        REQUIRE(p.owners[i].acquired == p.owners[i].released);
+        printf("- source hook source=%d acquire=%d release=%d\n", i,
+               p.owners[i].acquired, p.owners[i].released);
+    }
+    pl_renderer_destroy(&p.rr);
+    pl_renderer_destroy(&p.oracle);
+    pl_dispatch_destroy(&p.dp);
+    pl_mpv_user_shader_destroy(&output_hook);
+    pl_mpv_user_shader_destroy(&p.hook);
+    pl_mpv_user_shader_destroy(&p.oracle_hook);
+    for (int i = 0; i < 6; i++)
+        pl_tex_destroy(gpu, &tex[i]);
+}
+
+static void pl_custom_mix_tests(pl_gpu gpu)
+{
+    pl_fmt fmt = pl_find_fmt(gpu, PL_FMT_FLOAT, 4, 32, 32,
+        PL_FMT_CAP_SAMPLEABLE | PL_FMT_CAP_RENDERABLE | PL_FMT_CAP_HOST_READABLE);
+    if (!fmt || !(fmt->caps & PL_FMT_CAP_BLITTABLE)) {
+        printf("pl_custom_mix_tests: skipped (FP32 render/sample/read/clear required)\n");
+        return;
+    }
+    source_hook_tests(gpu, fmt);
+    printf("pl_custom_mix_tests:\n");
+    enum { W = 16, H = 12, N = W * H * 4 };
+    float pixels[N], actual[N], expected[N];
+    for (int i = 0; i < W * H; i++) {
+        pixels[4*i] = 0.2f + 0.01f * (i % W);
+        pixels[4*i+1] = 0.3f;
+        pixels[4*i+2] = 0.4f;
+        pixels[4*i+3] = 0.75f;
+    }
+    pl_tex src = pl_tex_create(gpu, pl_tex_params(
+        .w = W, .h = H, .format = fmt, .sampleable = true,
+        .host_writable = true, .initial_data = pixels));
+    pl_tex dst = pl_tex_create(gpu, pl_tex_params(
+        .w = W, .h = H, .format = fmt, .renderable = true,
+        .blit_dst = fmt->caps & PL_FMT_CAP_BLITTABLE,
+        .host_readable = true));
+    REQUIRE(src && dst);
+    struct pl_frame image = custom_mix_frame(src), target = custom_mix_frame(dst);
+    struct pl_frame sources[16];
+    const struct pl_frame *frames[16];
+    uint64_t signatures[16];
+    double timestamps[16];
+    for (int i = 0; i < 16; i++) {
+        sources[i] = image;
+        frames[i] = &sources[i];
+        signatures[i] = 100 + i;
+        // Non-float-representable values, well outside normal kernel radius.
+        timestamps[i] = i ? 32.0 * i + 0x1p-32 : -0.25 - 0x1p-40;
+    }
+    struct pl_frame_mix input = {
+        .frames = frames, .signatures = signatures, .timestamps = timestamps,
+        .vsync_duration = 1,
+    };
+    struct custom_mix_test test = {
+        .gpu = gpu, .dispatch = pl_dispatch_create(gpu->log, gpu),
+        .timestamps = timestamps,
+    };
+    struct pl_custom_frame_mixer mixer = {.priv = &test, .mix = custom_mix_callback};
+    pl_renderer rr = pl_renderer_create(gpu->log, gpu);
+    pl_renderer oracle = pl_renderer_create(gpu->log, gpu);
+    REQUIRE(rr && oracle && test.dispatch);
+    struct pl_render_params params = pl_render_default_params;
+    params.peak_detect_params = NULL;
+    params.dither_params = NULL;
+    params.background = PL_CLEAR_SKIP;
+    params.frame_mixer = &pl_filter_bilinear;
+    params.preserve_mixing_cache = true; // custom must still enforce view identity
+    for (int n = 1; n <= 16; n++) {
+        input.num_frames = test.count = n;
+        REQUIRE(pl_render_image_mix_custom(rr, &input, &target, &params, &mixer));
+    }
+    uint64_t ids[16];
+    memcpy(ids, test.ids, sizeof(ids));
+    REQUIRE(pl_render_image_mix_custom(rr, &input, &target, &params, &mixer));
+    REQUIRE_MEMEQ(ids, test.ids, sizeof(ids));
+    timestamps[0] -= 0x1p-30;
+    REQUIRE(pl_render_image_mix_custom(rr, &input, &target, &params, &mixer));
+    REQUIRE_MEMEQ(ids, test.ids, sizeof(ids));
+    REQUIRE(pl_render_image(oracle, &image, &target, &params));
+    custom_mix_download(gpu, dst, expected);
+    REQUIRE(pl_render_image_mix_custom(rr, &input, &target, &params, &mixer));
+    custom_mix_download(gpu, dst, actual);
+    custom_mix_compare(actual, expected, N);
+
+    // A mutable parameter must invalidate views without changing hook pointers.
+    static const char gain_shader[] =
+        "//!PARAM gain\n"
+        "//!TYPE DYNAMIC float\n"
+        "//!MINIMUM 0.0\n"
+        "//!MAXIMUM 1.0\n"
+        "1.0\n"
+        "//!HOOK MAIN\n"
+        "//!BIND HOOKED\n"
+        "vec4 hook() {\n"
+        "    vec4 color = HOOKED_texOff(0);\n"
+        "    color.rgb *= gain;\n"
+        "    return color;\n"
+        "}\n";
+    const struct pl_hook *gain_hook = pl_mpv_user_shader_parse(
+        gpu, gain_shader, sizeof(gain_shader) - 1);
+    REQUIRE(gain_hook && gain_hook->num_parameters == 1);
+    REQUIRE(gain_hook->parameters[0].type == PL_VAR_FLOAT);
+    params.hooks = &gain_hook;
+    params.num_hooks = 1;
+    float previous[N];
+    const float gains[] = {1.0f, 0.5f};
+    for (int step = 0; step < PL_ARRAY_SIZE(gains); step++) {
+        gain_hook->parameters[0].data->f = gains[step];
+        REQUIRE(pl_render_image(oracle, &image, &target, &params));
+        custom_mix_download(gpu, dst, expected);
+        REQUIRE(pl_render_image_mix_custom(rr, &input, &target, &params, &mixer));
+        custom_mix_download(gpu, dst, actual);
+        printf("- custom hook gain step=%d value=%g\n", step, gains[step]);
+        fflush(stdout);
+        custom_mix_compare(actual, expected, N);
+        if (step) {
+            for (int i = 0; i < 16; i++)
+                REQUIRE(ids[i] != test.ids[i]);
+            double difference = 0;
+            for (int i = 0; i < N; i++)
+                difference = PL_MAX(difference, fabs(actual[i] - previous[i]));
+            REQUIRE(difference > 0.003);
+        }
+        memcpy(previous, actual, sizeof(previous));
+        memcpy(ids, test.ids, sizeof(ids));
+        REQUIRE(pl_render_image_mix_custom(rr, &input, &target, &params, &mixer));
+        REQUIRE_MEMEQ(ids, test.ids, sizeof(ids));
+    }
+    params.hooks = NULL;
+    params.num_hooks = 0;
+    pl_mpv_user_shader_destroy(&gain_hook);
+
+    // Every view-changing operation must replace rendered-pixel identities.
+    struct pl_color_adjustment adjustment = pl_color_adjustment_neutral;
+    adjustment.brightness = 0.05f;
+    for (int change = 0; change < 7; change++) {
+        printf("- custom view identity change=%d\n", change);
+        fflush(stdout);
+        memcpy(ids, test.ids, sizeof(ids));
+        switch (change) {
+        case 0: target.color.transfer = PL_COLOR_TRC_BT_1886; break;
+        case 1: target.color.hdr.min_luma = 0.02f; break;
+        case 2: target.crop = (pl_rect2df){1, 1, W-1, H-1}; break;
+        case 3: target.rotation = PL_ROTATION_180; break;
+        case 4: params.color_adjustment = &adjustment; break;
+        case 5: pl_renderer_flush_cache(rr); break;
+        case 6: pl_renderer_reset(rr); break;
+        }
+        REQUIRE(pl_render_image_mix_custom(rr, &input, &target, &params, &mixer));
+        for (int i = 0; i < 16; i++)
+            REQUIRE(ids[i] != test.ids[i]);
+    }
+    target = custom_mix_frame(dst);
+    params.color_adjustment = NULL;
+    REQUIRE(pl_render_image_mix(rr, &input, &target, &params));
+    REQUIRE(pl_render_image_mix_custom(rr, &input, &target, &params, &mixer));
+    REQUIRE(pl_render_image(oracle, &image, &target, &params));
+    custom_mix_download(gpu, dst, expected);
+    REQUIRE(pl_render_image_mix_custom(rr, &input, &target, &params, &mixer));
+    custom_mix_download(gpu, dst, actual);
+    custom_mix_compare(actual, expected, N);
+    test.fail = true;
+    int calls = test.calls;
+    REQUIRE(!pl_render_image_mix_custom(rr, &input, &target, &params, &mixer));
+    REQUIRE(test.calls == calls + 1);
+    custom_mix_download(gpu, dst, expected);
+    REQUIRE_MEMEQ(actual, expected, sizeof(actual));
+    test.fail = false;
+    calls = test.calls;
+    params.peak_detect_params = &pl_peak_detect_default_params;
+    REQUIRE(!pl_render_image_mix_custom(rr, &input, &target, &params, &mixer));
+    params.peak_detect_params = NULL;
+    target.profile = (struct pl_icc_profile){.data = "x", .len = 1};
+    REQUIRE(!pl_render_image_mix_custom(rr, &input, &target, &params, &mixer));
+    target.profile = (struct pl_icc_profile){0};
+    target.repr.sys = PL_COLOR_SYSTEM_XYZ;
+    REQUIRE(!pl_render_image_mix_custom(rr, &input, &target, &params, &mixer));
+    target.repr.sys = PL_COLOR_SYSTEM_RGB;
+    sources[0].field = PL_FIELD_TOP;
+    REQUIRE(!pl_render_image_mix_custom(rr, &input, &target, &params, &mixer));
+    sources[0].field = PL_FIELD_NONE;
+    REQUIRE(test.calls == calls);
+    struct pl_custom_lut *conversion = pl_lut_parse_cube(gpu->log, test_luts[0],
+                                                        strlen(test_luts[0]));
+    REQUIRE(conversion);
+    params.lut = conversion;
+    params.lut_type = PL_LUT_CONVERSION;
+    REQUIRE(!pl_render_image_mix_custom(rr, &input, &target, &params, &mixer));
+    REQUIRE(test.calls == calls);
+    // The restriction belongs to custom preparation, not ordinary rendering.
+    REQUIRE(pl_render_image(oracle, &image, &target, &params));
+    params.lut = NULL;
+    params.lut_type = PL_LUT_UNKNOWN;
+    pl_lut_free(&conversion);
+    REQUIRE(pl_render_image_mix_custom(rr, &input, &target, &params, &mixer));
+
+    // Overlay alpha makes both omission and double composition observable.
+    for (int i = 0; i < W * H; i++) {
+        pixels[4*i] = 0.8f; pixels[4*i+1] = 0.1f;
+        pixels[4*i+2] = 0.2f; pixels[4*i+3] = 0.5f;
+    }
+    pl_tex overlay = pl_tex_create(gpu, pl_tex_params(
+        .w = W, .h = H, .format = fmt, .sampleable = true,
+        .initial_data = pixels));
+    REQUIRE(overlay);
+    struct pl_overlay_part parts[2] = {
+        {.src = {0, 0, W, H}, .dst = {2, 2, 7, 6}},
+        {.src = {0, 0, W, H}, .dst = {8, 5, 13, 10}},
+    };
+    struct pl_overlay overlays[2];
+    for (int i = 0; i < 2; i++) {
+        overlays[i] = (struct pl_overlay) {
+            .tex = overlay, .mode = PL_OVERLAY_NORMAL,
+            .repr = image.repr, .color = image.color,
+            .num_parts = 1, .parts = &parts[i],
+        };
+    }
+    input.num_frames = test.count = 1;
+    sources[0].overlays = &overlays[0]; sources[0].num_overlays = 1;
+    target.overlays = &overlays[1]; target.num_overlays = 1;
+    for (int geometry = 0; geometry < 7; geometry++) {
+        printf("- custom overlay geometry=%d\n", geometry);
+        fflush(stdout);
+        test.verify_clean = geometry == 0;
+        test.encoded = target.color;
+        if (geometry == 1) {
+            sources[0].crop = (pl_rect2df){1, 1, W-1, H-1};
+            sources[0].rotation = PL_ROTATION_180;
+        } else if (geometry == 2) {
+            target.crop = (pl_rect2df){W-1, 1, 1, H-1};
+        } else if (geometry >= 3) {
+            sources[0].rotation = geometry & 1 ? PL_ROTATION_90 : PL_ROTATION_270;
+            target.rotation = geometry < 5 ? PL_ROTATION_90 : PL_ROTATION_270;
+            sources[0].crop = (pl_rect2df){2, 1, W-1, H-2};
+            target.crop = geometry & 1 ? (pl_rect2df){1, 2, W-2, H-1}
+                                      : (pl_rect2df){W-2, H-1, 1, 2};
+        }
+        signatures[0]++;
+        REQUIRE(pl_render_image(oracle, &sources[0], &target, &params));
+        custom_mix_download(gpu, dst, expected);
+        REQUIRE(pl_render_image_mix_custom(rr, &input, &target, &params, &mixer));
+        custom_mix_download(gpu, dst, actual);
+        custom_mix_compare(actual, expected, N);
+    }
+    test.verify_clean = false;
+    // A different reference must supply the sole source overlay. Its overlay
+    // descriptor is invalid outside acquire/release, including on cache hits.
+    sources[0] = sources[1] = image;
+    target = custom_mix_frame(dst);
+    target.overlays = &overlays[1]; target.num_overlays = 1;
+    struct custom_mix_owner source_owner = {
+        .overlay = &overlays[0], .overlay_texture = overlay,
+    };
+    struct custom_mix_owner target_owner = {
+        .set_crop = true, .crop = {1, 1, W-1, H-1},
+    };
+    sources[1].acquire = custom_mix_acquire;
+    sources[1].release = custom_mix_release;
+    sources[1].user_data = &source_owner;
+    target.acquire = custom_mix_acquire;
+    target.release = custom_mix_release;
+    target.user_data = &target_owner;
+    timestamps[0] = -32; timestamps[1] = 0.25 + 0x1p-40;
+    input.num_frames = test.count = 2;
+    test.reference = 1;
+    signatures[0] += 30; signatures[1] += 30;
+    for (int pass = 0; pass < 3; pass++) {
+        if (pass == 2)
+            target_owner.crop = (pl_rect2df){W-2, 1, 2, H-1};
+        REQUIRE(pl_render_image(oracle, &sources[1], &target, &params));
+        custom_mix_download(gpu, dst, expected);
+        int source_calls = source_owner.acquired;
+        int target_calls = target_owner.acquired;
+        memcpy(ids, test.ids, sizeof(ids));
+        REQUIRE(pl_render_image_mix_custom(rr, &input, &target, &params, &mixer));
+        REQUIRE(source_owner.acquired == source_calls + (pass == 1 ? 1 : 2));
+        REQUIRE(target_owner.acquired == target_calls + 1);
+        REQUIRE(source_owner.acquired == source_owner.released);
+        REQUIRE(target_owner.acquired == target_owner.released);
+        REQUIRE(!source_owner.active && !target_owner.active && !overlays[0].tex);
+        if (pass == 1) {
+            REQUIRE(test.ids[0] == ids[0] && test.ids[1] == ids[1]);
+        } else if (pass == 2) {
+            REQUIRE(test.ids[0] != ids[0] && test.ids[1] != ids[1]);
+        }
+        custom_mix_download(gpu, dst, actual);
+        custom_mix_compare(actual, expected, N);
+    }
+    // Fail while preparing the second source, after the target was acquired.
+    // This must release both acquisitions once, without reaching the mixer.
+    source_owner.fail = true;
+    signatures[1]++;
+    int source_calls = source_owner.acquired;
+    int target_calls = target_owner.acquired;
+    calls = test.calls;
+    REQUIRE(!pl_render_image_mix_custom(rr, &input, &target, &params, &mixer));
+    REQUIRE(test.calls == calls);
+    REQUIRE(source_owner.acquired == source_calls + 1);
+    REQUIRE(target_owner.acquired == target_calls + 1);
+    REQUIRE(source_owner.acquired == source_owner.released);
+    REQUIRE(target_owner.acquired == target_owner.released);
+    REQUIRE(!source_owner.active && !target_owner.active);
+    source_owner.fail = false;
+    REQUIRE(pl_render_image_mix_custom(rr, &input, &target, &params, &mixer));
+    REQUIRE(source_owner.acquired == source_owner.released);
+    REQUIRE(target_owner.acquired == target_owner.released);
+    // Populate legacy cache, then fail while replacing it with custom views.
+    // Clearing the reported error must not make a partially replaced cache
+    // look like a valid legacy result.
+    REQUIRE(pl_render_image_mix(rr, &input, &target, &params));
+    REQUIRE(pl_render_image_mix(oracle, &input, &target, &params));
+    custom_mix_download(gpu, dst, expected);
+    source_owner.fail = true;
+    calls = test.calls;
+    source_calls = source_owner.acquired;
+    target_calls = target_owner.acquired;
+    REQUIRE(!pl_render_image_mix_custom(rr, &input, &target, &params, &mixer));
+    REQUIRE(test.calls == calls);
+    REQUIRE(source_owner.acquired == source_calls + 1);
+    REQUIRE(target_owner.acquired == target_calls + 1);
+    REQUIRE(source_owner.acquired == source_owner.released);
+    REQUIRE(target_owner.acquired == target_owner.released);
+    source_owner.fail = false;
+    pl_renderer_reset_errors(rr, NULL);
+    REQUIRE(pl_render_image_mix(rr, &input, &target, &params));
+    custom_mix_download(gpu, dst, actual);
+    custom_mix_compare(actual, expected, N);
+
+    // Failed target acquisition is released once and never reaches a source
+    // or the mixer. Releasing a borrowed inner target would double-release it.
+    target_owner.fail = true;
+    source_calls = source_owner.acquired;
+    target_calls = target_owner.acquired;
+    calls = test.calls;
+    REQUIRE(!pl_render_image_mix_custom(rr, &input, &target, &params, &mixer));
+    REQUIRE(test.calls == calls && source_owner.acquired == source_calls);
+    REQUIRE(target_owner.acquired == target_calls + 1);
+    REQUIRE(target_owner.acquired == target_owner.released);
+    REQUIRE(!source_owner.active && !target_owner.active);
+    target_owner.fail = false;
+    REQUIRE(pl_render_image_mix_custom(rr, &input, &target, &params, &mixer));
+    REQUIRE(source_owner.acquired == source_owner.released);
+    REQUIRE(target_owner.acquired == target_owner.released);
+    test.reference = 0;
+    timestamps[0] = -0.25 - 0x1p-40;
+    timestamps[1] = 32 + 0x1p-32;
+    input.num_frames = test.count = 1;
+    pl_tex_destroy(gpu, &overlay);
+    sources[0] = image;
+    target = custom_mix_frame(dst);
+
+    // Authored HDR adaptation remains per-source. Compare custom endpoints to
+    // normal rendering, including nonzero display black and transparent RGB.
+    const enum pl_color_transfer trcs[] = {PL_COLOR_TRC_GAMMA22,
+                                           PL_COLOR_TRC_BT_1886};
+    for (int t = 0; t < 2; t++) {
+        target.color.transfer = trcs[t];
+        for (int hdr = 0; hdr < 3; hdr++) {
+            sources[0] = image;
+            if (hdr) {
+                sources[0].color = pl_color_space_hdr10;
+                sources[0].color.transfer = hdr == 1 ? PL_COLOR_TRC_PQ
+                                                    : PL_COLOR_TRC_HLG;
+                sources[0].color.hdr.scene_max[0] = 600;
+                sources[0].color.hdr.scene_max[1] = 500;
+                sources[0].color.hdr.scene_max[2] = 400;
+                sources[0].color.hdr.scene_avg = 80;
+            }
+            signatures[0]++;
+            REQUIRE(pl_render_image(oracle, &sources[0], &target, &params));
+            custom_mix_download(gpu, dst, expected);
+            REQUIRE(pl_render_image_mix_custom(rr, &input, &target, &params, &mixer));
+            custom_mix_download(gpu, dst, actual);
+            custom_mix_compare(actual, expected, N);
+            if (hdr == 1) {
+                // HDR source adaptation preserves the requested target peak;
+                // SDR inference can instead replace it with the source peak.
+                uint64_t old_id = test.ids[0];
+                uint64_t source_signature = signatures[0];
+                target.color.hdr.max_luma = 100;
+                REQUIRE(pl_render_image(oracle, &sources[0], &target, &params));
+                custom_mix_download(gpu, dst, expected);
+                REQUIRE(pl_render_image_mix_custom(rr, &input, &target, &params,
+                                                    &mixer));
+                REQUIRE(signatures[0] == source_signature);
+                REQUIRE(test.ids[0] != old_id);
+                custom_mix_download(gpu, dst, actual);
+                custom_mix_compare(actual, expected, N);
+                printf("- custom HDR target peak identity trc=%d passed\n", trcs[t]);
+                target.color.hdr.max_luma = 203;
+            }
+        }
+    }
+
+    // Linear mixing has a CPU oracle independent of renderer intermediate RGB.
+    sources[0] = sources[1] = image;
+    sources[0].color.transfer = sources[1].color.transfer = PL_COLOR_TRC_LINEAR_HDR;
+    sources[0].color.hdr = sources[1].color.hdr = target.color.hdr;
+    sources[1].color.hdr.max_luma = target.color.hdr.max_luma;
+    float second_pixels[N];
+    for (int i = 0; i < W * H; i++) {
+        second_pixels[4*i] = 0.3f; second_pixels[4*i+1] = 0.2f;
+        second_pixels[4*i+2] = 0.1f; second_pixels[4*i+3] = 0.25f;
+    }
+    pl_tex second = pl_tex_create(gpu, pl_tex_params(
+        .w = W, .h = H, .format = fmt, .sampleable = true,
+        .initial_data = second_pixels));
+    REQUIRE(second);
+    sources[1].planes[0].texture = second;
+    signatures[0] += 100; signatures[1] += 100;
+    input.num_frames = test.count = 2;
+    test.blend = true;
+    const float mix_phases[] = {0, 0.25f, 0.75f, 1};
+    for (int phase = 0; phase < PL_ARRAY_SIZE(mix_phases); phase++) {
+        test.alpha = mix_phases[phase];
+        printf("- custom linear phase=%.9g\n", test.alpha);
+        fflush(stdout);
+        REQUIRE(pl_render_image_mix_custom(rr, &input, &target, &params, &mixer));
+        custom_mix_download(gpu, dst, actual);
+        // Original source texture was never changed by the overlay fixture.
+        for (int i = 0; i < W * H; i++) {
+            float a = (1-test.alpha)*0.75f + test.alpha*0.25f;
+            float rgb[3] = {
+                ((1-test.alpha)*(0.2f+0.01f*(i%W))*0.75f + test.alpha*0.3f*0.25f)/a,
+                ((1-test.alpha)*0.3f*0.75f + test.alpha*0.2f*0.25f)/a,
+                ((1-test.alpha)*0.4f*0.75f + test.alpha*0.1f*0.25f)/a,
+            };
+            pl_color_delinearize(&target.color, rgb);
+            for (int c = 0; c < 3; c++) expected[4*i+c] = rgb[c];
+            expected[4*i+3] = a;
+        }
+        custom_mix_compare(actual, expected, N);
+    }
+    test.blend = false;
+    input.num_frames = test.count = 1;
+    sources[0] = image;
+    for (int opacity = 0; opacity <= 1; opacity++) {
+        printf("- custom source opacity=%d\n", opacity);
+        fflush(stdout);
+        for (int i = 0; i < W * H; i++) {
+            pixels[4*i] = 0.2f + 0.01f * (i % W);
+            pixels[4*i+1] = 0.3f;
+            pixels[4*i+2] = 0.4f;
+            pixels[4*i+3] = opacity;
+        }
+        REQUIRE(pl_tex_upload(gpu, pl_tex_transfer_params(.tex = src, .ptr = pixels)));
+        signatures[0]++;
+        REQUIRE(pl_render_image(oracle, &sources[0], &target, &params));
+        custom_mix_download(gpu, dst, expected);
+        REQUIRE(pl_render_image_mix_custom(rr, &input, &target, &params, &mixer));
+        custom_mix_download(gpu, dst, actual);
+        custom_mix_compare(actual, expected, N);
+        for (int i = 0; i < W * H; i++)
+            REQUIRE(fabsf(actual[4*i+3] - opacity) < 0.000001f);
+    }
+    pl_tex_destroy(gpu, &second);
+    pl_tex_destroy(gpu, &test.output);
+    pl_dispatch_destroy(&test.dispatch);
+    pl_renderer_destroy(&oracle);
+    pl_renderer_destroy(&rr);
+    pl_tex_destroy(gpu, &src);
+    pl_tex_destroy(gpu, &dst);
+    printf("- custom mixer inputs, identities, overlays, HDR and linear phases passed\n");
+}
+
+static pl_shader peak_record_shader(pl_dispatch dispatch, pl_tex pattern,
+                                     float level)
+{
+    pl_shader sh = pl_dispatch_begin(dispatch);
+    REQUIRE(pl_shader_sample_direct(sh, pl_sample_src(.tex = pattern)));
+    REQUIRE(pl_shader_custom(sh, &(struct pl_custom_shader) {
+        .input = PL_SHADER_SIG_COLOR, .output = PL_SHADER_SIG_COLOR,
+        .body = "color.rgb *= level;",
+        .variables = &(struct pl_shader_var) {
+            .var = pl_var_float("level"), .data = &level,
+        },
+        .num_variables = 1,
+    }));
+    return sh;
+}
+
+static void peak_record_metadata_equal(const struct pl_hdr_metadata *a,
+                                       const struct pl_hdr_metadata *b)
+{
+    REQUIRE(a->max_pq_y == b->max_pq_y);
+    REQUIRE(a->avg_pq_y == b->avg_pq_y);
+    REQUIRE(a->scene_avg == b->scene_avg);
+    for (int c = 0; c < 3; c++)
+        REQUIRE(a->scene_max[c] == b->scene_max[c]);
+}
+
+static void peak_record_cpu_tests(void)
+{
+    // Analytic IIR and partial scene-change response. Values deliberately
+    // exceed quantization epsilon; no production reduction helper is used.
+    struct pl_peak_detect_params params = pl_peak_detect_default_params;
+    params.smoothing_period = 2;
+    for (int scene = 0; scene < 2; scene++) {
+        params.scene_threshold_low = scene ? 1 : 0;
+        params.scene_threshold_high = scene ? 10 : 0;
+        struct sh_peak_result history = {
+            .avg_pq = .2f, .max_pq = .2f, .scene_avg_pq = .2f,
+            .scene_max_pq = .2f, .max_y_pq = .2f, .active_ratio = 1,
+        };
+        const struct sh_peak_result sample = {
+            .avg_pq = .7f, .max_pq = .7f, .scene_avg_pq = .7f,
+            .scene_max_pq = .7f, .max_y_pq = .7f, .active_ratio = .25f,
+        };
+        double expected = .2 + (1.0 - exp(-.5)) * (.7 - .2);
+        if (scene) {
+            double delta = .25 * (.7 - expected);
+            double x = (delta - .01) / (.10 - .01);
+            REQUIRE(x > 0 && x < 1); // exercise the hysteresis ramp, not an endpoint
+            double weight = x*x*(3 - 2*x);
+            expected += weight * (.7 - expected);
+        }
+        sh_peak_smooth(&history, &sample, &params);
+        REQUIRE(fabs(history.avg_pq - expected) < 1e-6);
+        REQUIRE(fabs(history.max_pq - expected) < 1e-6);
+        REQUIRE(fabs(history.scene_avg_pq - expected) < 1e-6);
+        REQUIRE(fabs(history.scene_max_pq - expected) < 1e-6);
+        REQUIRE(fabs(history.max_y_pq - expected) < 1e-6);
+        REQUIRE(history.active_ratio == .25f);
+    }
+}
+
+static void peak_record_tests(pl_gpu gpu)
+{
+    peak_record_cpu_tests();
+    struct sh_peak_result invalid = {.avg_pq = -1, .active_ratio = -1};
+    struct sh_peak_result unchanged = invalid;
+    REQUIRE(sh_get_peak_measurement(NULL, false, &invalid) == SH_PEAK_ERROR);
+    REQUIRE_MEMEQ(&invalid, &unchanged, sizeof(invalid));
+    pl_fmt fmt = pl_find_fmt(gpu, PL_FMT_FLOAT, 4, 32, 32,
+        PL_FMT_CAP_SAMPLEABLE | PL_FMT_CAP_RENDERABLE | PL_FMT_CAP_HOST_READABLE);
+    if (!fmt || !gpu->glsl.compute || !gpu->limits.max_ssbo_size)
+        return;
+    printf("peak_record_tests: measurement and temporal primitives\n");
+    pl_dispatch dispatch = pl_dispatch_create(gpu->log, gpu);
+    float pixels[32 * 32 * 4];
+    for (int y = 0; y < 32; y++) {
+        for (int x = 0; x < 32; x++) {
+            int i = 4 * (32 * y + x);
+            for (int c = 0; c < 3; c++)
+                pixels[i+c] = x < 16 && y < 16 ? 1 : 0;
+            pixels[i+3] = 1;
+        }
+    }
+    // Immutable across all queued measurements, including reverse readback.
+    pl_tex pattern = pl_tex_create(gpu, pl_tex_params(
+        .w = 32, .h = 32, .format = fmt, .sampleable = true,
+        .initial_data = pixels));
+    REQUIRE(pattern);
+    pl_tex target = pl_tex_create(gpu, pl_tex_params(
+        .w = 32, .h = 32, .format = fmt, .renderable = true,
+        .host_readable = true));
+    REQUIRE(dispatch && target);
+    struct pl_color_space color = pl_color_space_hdr10;
+    color.transfer = PL_COLOR_TRC_LINEAR_HDR;
+    const float levels[] = {.1f, 4.0f, .5f};
+    for (int delayed = 0; delayed < 2; delayed++) {
+        struct pl_peak_detect_params params = pl_peak_detect_default_params;
+        params.smoothing_period = 3;
+        params.scene_threshold_low = 2;
+        params.scene_threshold_high = 9;
+        params.percentile = 93;
+        params.black_cutoff = 2;
+        params.allow_delayed = delayed;
+        pl_shader_obj records[3] = {0}, legacy = NULL, selected = NULL;
+        struct sh_peak_result raw[3], history = {0};
+        for (int i = 0; i < 3; i++) {
+            pl_shader sh = peak_record_shader(dispatch, pattern, levels[i]);
+            REQUIRE(sh_measure_peak(sh, color, &records[i], &params));
+            struct sh_peak_result sentinel = {
+                .avg_pq = -1, .max_pq = -2, .scene_avg_pq = -3,
+                .scene_max_pq = -4, .max_y_pq = -5, .active_ratio = -6,
+            }, result = sentinel;
+            REQUIRE(sh_get_peak_measurement(records[i], false, &result) ==
+                    SH_PEAK_PENDING);
+            REQUIRE_MEMEQ(&sentinel, &result, sizeof(result));
+            REQUIRE(pl_dispatch_compute(dispatch, pl_dispatch_compute_params(
+                .shader = &sh, .width = 32, .height = 32)));
+        }
+        // GPU completion/readback order must not be a temporal commit order.
+        for (int i = 2; i >= 0; i--) {
+            REQUIRE(sh_get_peak_measurement(records[i], true, &raw[i]) == SH_PEAK_READY);
+            REQUIRE(raw[i].active_ratio == .25f);
+            struct sh_peak_result again = {0};
+            REQUIRE(sh_get_peak_measurement(records[i], false, &again) == SH_PEAK_READY);
+            REQUIRE_MEMEQ(&raw[i], &again, sizeof(again));
+        }
+        for (int i = 0; i < 3; i++) {
+            sh_peak_smooth(&history, &raw[i], &params);
+            struct pl_hdr_metadata expected = {0}, actual = {0};
+            REQUIRE(sh_peak_metadata(&history, &expected));
+            pl_shader sh = peak_record_shader(dispatch, pattern, levels[i]);
+            REQUIRE(pl_shader_detect_peak(sh, color, &legacy, &params));
+            REQUIRE(pl_dispatch_compute(dispatch, pl_dispatch_compute_params(
+                .shader = &sh, .width = 32, .height = 32)));
+            pl_gpu_finish(gpu);
+            REQUIRE(pl_get_detected_hdr_metadata(legacy, &actual));
+            peak_record_metadata_equal(&actual, &expected);
+            REQUIRE(sh_color_map_set_peak(gpu, &selected, &history));
+            struct sh_peak_result saved = history;
+            for (int repeat = 0; repeat < 3; repeat++) {
+                REQUIRE(pl_get_detected_hdr_metadata(selected, &actual));
+                peak_record_metadata_equal(&actual, &expected);
+                REQUIRE(sh_get_peak_measurement(records[i], false, &raw[i]) == SH_PEAK_READY);
+                REQUIRE_MEMEQ(&history, &saved, sizeof(history));
+            }
+            // Legacy smoothed state and selected snapshot must map identical pixels.
+            float output[2][32 * 32 * 4];
+            for (int path = 0; path < 2; path++) {
+                sh = peak_record_shader(dispatch, pattern, levels[i]);
+                pl_shader_color_map_ex(sh, &pl_color_map_default_params,
+                    pl_color_map_args(.src = color, .dst = pl_color_space_bt709,
+                                      .state = path ? &selected : &legacy));
+                REQUIRE(pl_dispatch_finish(dispatch, pl_dispatch_params(
+                    .shader = &sh, .target = target)));
+                REQUIRE(pl_tex_download(gpu, pl_tex_transfer_params(
+                    .tex = target, .ptr = output[path])));
+            }
+            for (int p = 0; p < 32 * 32 * 4; p++) {
+                REQUIRE(isfinite(output[0][p]) && isfinite(output[1][p]));
+                REQUIRE(fabsf(output[0][p] - output[1][p]) < 1e-6f);
+            }
+            REQUIRE(pl_get_detected_hdr_metadata(selected, &actual));
+            peak_record_metadata_equal(&actual, &expected);
+        }
+        // A queued legacy shader cannot be replaced by a presentation snapshot.
+        pl_shader sh = peak_record_shader(dispatch, pattern, levels[2]);
+        struct sh_peak_result after_pending = history;
+        sh_peak_smooth(&after_pending, &raw[2], &params);
+        REQUIRE(pl_shader_detect_peak(sh, color, &legacy, &params));
+        // Preflight failure must not replace/consume an already queued source,
+        // even if the rejected invocation requests different measurement policy.
+        struct pl_peak_detect_params rejected_params = params;
+        rejected_params.black_cutoff += 1;
+        pl_shader_obj original_state = legacy;
+        pl_shader rejected = peak_record_shader(dispatch, pattern, 9);
+        rejected->type = SH_FRAGMENT;
+        REQUIRE(!pl_shader_detect_peak(rejected, color, &legacy, &rejected_params));
+        REQUIRE(legacy == original_state);
+        pl_dispatch_abort(dispatch, &rejected);
+        pl_shader_obj fresh_measurement = NULL;
+        rejected = peak_record_shader(dispatch, pattern, 9);
+        rejected->type = SH_FRAGMENT;
+        REQUIRE(!sh_measure_peak(rejected, color, &fresh_measurement, &params));
+        REQUIRE(!fresh_measurement);
+        pl_dispatch_abort(dispatch, &rejected);
+        REQUIRE(!sh_color_map_set_peak(gpu, &legacy, &history));
+        REQUIRE(pl_dispatch_compute(dispatch, pl_dispatch_compute_params(
+            .shader = &sh, .width = 32, .height = 32)));
+        pl_gpu_finish(gpu);
+        struct pl_hdr_metadata measured = {0};
+        REQUIRE(pl_get_detected_hdr_metadata(legacy, &measured));
+        struct pl_hdr_metadata pending_expected = {0};
+        REQUIRE(sh_peak_metadata(&after_pending, &pending_expected));
+        peak_record_metadata_equal(&measured, &pending_expected);
+        pl_reset_detected_peak(legacy);
+        REQUIRE(sh_color_map_set_peak(gpu, &legacy, &history));
+        struct pl_hdr_metadata selected_meta = {0}, expected = {0};
+        REQUIRE(pl_get_detected_hdr_metadata(legacy, &selected_meta));
+        REQUIRE(sh_peak_metadata(&history, &expected));
+        peak_record_metadata_equal(&selected_meta, &expected);
+        for (int i = 0; i < 3; i++) pl_shader_obj_destroy(&records[i]);
+        pl_shader_obj_destroy(&legacy);
+        pl_shader_obj_destroy(&selected);
+    }
+
+    // Changing only black_cutoff must reset legacy smoothing, as a fresh state.
+    // Disable scene snapping here so it cannot hide a missing policy reset.
+    struct pl_peak_detect_params params = pl_peak_detect_default_params;
+    params.scene_threshold_low = 0;
+    params.scene_threshold_high = 0;
+    params.allow_delayed = false;
+    params.black_cutoff = 0;
+    printf("- peak cutoff-only reset without scene snapping\n");
+    fflush(stdout);
+    pl_shader_obj reused = NULL, fresh = NULL;
+    pl_shader sh = peak_record_shader(dispatch, pattern, 4);
+    REQUIRE(pl_shader_detect_peak(sh, color, &reused, &params));
+    REQUIRE(pl_dispatch_compute(dispatch, pl_dispatch_compute_params(
+        .shader = &sh, .width = 32, .height = 32)));
+    pl_gpu_finish(gpu);
+    struct pl_hdr_metadata before = {0};
+    REQUIRE(pl_get_detected_hdr_metadata(reused, &before));
+    params.black_cutoff = 40;
+    struct pl_hdr_metadata results[2] = {0};
+    for (int path = 0; path < 2; path++) {
+        sh = peak_record_shader(dispatch, pattern, .0001f);
+        REQUIRE(pl_shader_detect_peak(sh, color, path ? &fresh : &reused, &params));
+        REQUIRE(pl_dispatch_compute(dispatch, pl_dispatch_compute_params(
+            .shader = &sh, .width = 32, .height = 32)));
+        pl_gpu_finish(gpu);
+        REQUIRE(pl_get_detected_hdr_metadata(path ? fresh : reused, &results[path]));
+    }
+    peak_record_metadata_equal(&results[0], &results[1]);
+    REQUIRE(fabsf(before.avg_pq_y - results[0].avg_pq_y) > .1f);
+    pl_shader_obj_destroy(&reused);
+    pl_shader_obj_destroy(&fresh);
+
+    // Solid black has no active workgroups and remains a valid immutable result.
+    pl_shader_obj black = NULL;
+    sh = peak_record_shader(dispatch, pattern, 0);
+    REQUIRE(sh_measure_peak(sh, color, &black, &params));
+    REQUIRE(pl_dispatch_compute(dispatch, pl_dispatch_compute_params(
+        .shader = &sh, .width = 32, .height = 32)));
+    struct sh_peak_result result = {0};
+    REQUIRE(sh_get_peak_measurement(black, true, &result) == SH_PEAK_READY);
+    REQUIRE(result.active_ratio == 0);
+    REQUIRE(result.avg_pq == PL_COLOR_HDR_BLACK && result.max_pq == PL_COLOR_HDR_BLACK);
+    pl_shader_obj_destroy(&black);
+    pl_dispatch_destroy(&dispatch);
+    pl_tex_destroy(gpu, &target);
+    pl_tex_destroy(gpu, &pattern);
+    printf("- peak primitive ordering, immutable snapshots and cutoff reset passed\n");
+}
+
+static void source_time_expect(pl_source_peak_state state, uint64_t epoch,
+                               uint64_t id, const struct sh_peak_result *result)
+{
+    struct pl_hdr_metadata actual = {0}, expected = {0};
+    REQUIRE(pl_source_peak_get_hdr_metadata(state, epoch, id, &actual));
+    REQUIRE(sh_peak_metadata(result, &expected));
+    peak_record_metadata_equal(&actual, &expected);
+}
+
+struct source_time_info { int frames, blends; };
+
+static void source_time_info_cb(void *priv, const struct pl_render_info *info)
+{
+    struct source_time_info *counts = priv;
+    if (info->stage == PL_RENDER_STAGE_BLEND)
+        counts->blends++;
+    else
+        counts->frames++;
+}
+
+struct source_time_reentry {
+    pl_renderer rr;
+    pl_source_peak_state state;
+    const struct pl_frame *source;
+    const struct pl_peak_detect_params *params;
+    int acquired, released;
+};
+
+static void source_time_reenter(struct source_time_reentry *owner)
+{
+    REQUIRE(!pl_source_peak_state_reset(owner->state, 99));
+    REQUIRE(pl_source_peak_submit(owner->rr, owner->state, 5, 200,
+                                 owner->source, owner->params) == PL_SOURCE_PEAK_ERROR);
+}
+
+static bool source_time_acquire(pl_gpu gpu, struct pl_frame *frame)
+{
+    (void) gpu;
+    struct source_time_reentry *owner = frame->user_data;
+    owner->acquired++;
+    source_time_reenter(owner);
+    return true;
+}
+
+static void source_time_release(pl_gpu gpu, struct pl_frame *frame)
+{
+    (void) gpu;
+    struct source_time_reentry *owner = frame->user_data;
+    owner->released++;
+    source_time_reenter(owner);
+}
+
+static void source_time_pixels(pl_gpu gpu, pl_renderer rr,
+                               pl_dispatch dispatch, pl_tex dst,
+                               const struct pl_frame *dark,
+                               const struct pl_frame *bright)
+{
+    // Include sub-peak values so changing the estimator is observable, rather
+    // than comparing only black and fully clipped white endpoints.
+    float data[32 * 32 * 4];
+    const float levels[] = {.05f, .2f, .5f, 4};
+    for (int i = 0; i < 32 * 32; i++) {
+        for (int c = 0; c < 3; c++)
+            data[4*i+c] = levels[(i % 32) / 8];
+        data[4*i+3] = 1;
+    }
+    pl_tex tex = pl_tex_create(gpu, pl_tex_params(
+        .w = 32, .h = 32, .format = dst->params.format,
+        .sampleable = true, .initial_data = data));
+    REQUIRE(tex);
+    struct pl_frame source = *bright;
+    source.planes[0].texture = tex;
+    source.acquire = NULL;
+    source.release = NULL;
+    struct pl_frame target = custom_mix_frame(dst);
+    pl_renderer oracle = pl_renderer_create(gpu->log, gpu);
+    pl_source_peak_state state = pl_source_peak_state_create(gpu->log, gpu);
+    REQUIRE(oracle && state);
+    struct pl_peak_detect_params peak = pl_peak_detect_default_params;
+    peak.smoothing_period = 3;
+    peak.scene_threshold_low = peak.scene_threshold_high = 0;
+    peak.allow_delayed = false;
+    struct pl_color_map_params mapping = pl_color_map_default_params;
+    mapping.mastering_clip = 0;
+    struct pl_color_adjustment adjustment = pl_color_adjustment_neutral;
+    adjustment.brightness = .03f;
+    struct pl_render_params params = pl_render_default_params;
+    params.peak_detect_params = &peak;
+    params.color_map_params = &mapping;
+    params.color_adjustment = &adjustment;
+    params.dither_params = NULL;
+    params.frame_mixer = NULL;
+    params.skip_caching_single_frame = true;
+    const struct pl_frame *frames[] = {&source};
+    uint64_t id = 40, signature = 777;
+    double timestamp = 0;
+    struct pl_frame_mix mix = {
+        .num_frames = 1, .frames = frames, .signatures = &signature,
+        .timestamps = &timestamp, .vsync_duration = 1,
+    };
+    struct pl_source_peak_context context = {
+        .state = state, .epoch = 1, .ids = &id, .current_id = id,
+    };
+    struct custom_mix_test custom = {
+        .gpu = gpu, .dispatch = dispatch, .count = 1, .timestamps = &timestamp,
+    };
+    struct pl_custom_frame_mixer mixer = {.priv = &custom, .mix = custom_mix_callback};
+    REQUIRE(pl_source_peak_submit(rr, state, 1, 10, dark, &peak) >= 0);
+    REQUIRE(pl_source_peak_submit(rr, state, 1, id, &source, &peak) >= 0);
+    float actual[32 * 32 * 4], expected[32 * 32 * 4], previous[32 * 32 * 4];
+    uint64_t previous_id = 0;
+    for (int change = 0; change < 3; change++) {
+        if (change == 1) {
+            peak.allow_delayed = true;
+            REQUIRE(pl_source_peak_submit(rr, state, 1, id, &source, &peak) >= 0);
+        } else if (change == 2) {
+            REQUIRE(pl_source_peak_state_reset(state, 2));
+            context.epoch = 2;
+            peak.allow_delayed = false;
+            REQUIRE(pl_source_peak_submit(rr, state, 2, id, &source, &peak) >= 0);
+        }
+        REQUIRE(pl_render_image_mix_source(rr, &mix, &target, &params, &context, NULL));
+        custom_mix_download(gpu, dst, actual);
+        struct pl_frame reference = source;
+        REQUIRE(pl_source_peak_get_hdr_metadata(state, context.epoch, id,
+                                                &reference.color.hdr));
+        struct pl_render_params reference_params = params;
+        reference_params.peak_detect_params = NULL;
+        REQUIRE(pl_render_image(oracle, &reference, &target, &reference_params));
+        custom_mix_download(gpu, dst, expected);
+        printf("source-time pixel change=%d\n", change);
+        fflush(stdout);
+        custom_mix_compare(actual, expected, 32 * 32 * 4);
+        if (change) {
+            float difference = 0;
+            for (int i = 0; i < 32 * 32 * 4; i++)
+                difference = PL_MAX(difference, fabsf(expected[i] - previous[i]));
+            printf("source-time observable change=%d max=%g\n", change, difference);
+            fflush(stdout);
+            REQUIRE(difference > .003f);
+        }
+        memcpy(previous, expected, sizeof(previous));
+        REQUIRE(pl_render_image_mix_source(rr, &mix, &target, &params, &context, &mixer));
+        custom_mix_download(gpu, dst, actual);
+        custom_mix_compare(actual, expected, 32 * 32 * 4);
+        if (change)
+            REQUIRE(custom.ids[0] != previous_id);
+        previous_id = custom.ids[0];
+        // Confirm the view adjustment is visible in the independent oracle.
+        reference_params.color_adjustment = NULL;
+        REQUIRE(pl_render_image(oracle, &reference, &target, &reference_params));
+        custom_mix_download(gpu, dst, actual);
+        float difference = 0;
+        for (int i = 0; i < 32 * 32 * 4; i++)
+            difference = PL_MAX(difference, fabsf(actual[i] - expected[i]));
+        REQUIRE(difference > .003f);
+    }
+    pl_renderer_flush_cache(rr);
+    pl_source_peak_state_destroy(&state);
+    pl_renderer_destroy(&oracle);
+    pl_tex_destroy(gpu, &tex);
+}
+
+static void source_time_image(pl_gpu gpu, pl_tex dst,
+                              const struct pl_frame native[3],
+                              const struct sh_peak_result after[3])
+{
+    pl_renderer rr = pl_renderer_create(gpu->log, gpu);
+    pl_renderer oracle = pl_renderer_create(gpu->log, gpu);
+    pl_source_peak_state state = pl_source_peak_state_create(gpu->log, gpu);
+    REQUIRE(rr && oracle && state);
+    struct pl_peak_detect_params peak = pl_peak_detect_default_params;
+    peak.smoothing_period = 3;
+    peak.scene_threshold_low = peak.scene_threshold_high = 0;
+    peak.percentile = 97;
+    peak.black_cutoff = 2;
+    peak.allow_delayed = false;
+    struct pl_color_map_params mapping = pl_color_map_default_params;
+    mapping.mastering_clip = 0;
+    struct pl_render_params params = pl_render_default_params;
+    params.peak_detect_params = &peak;
+    params.color_map_params = &mapping;
+    params.dither_params = NULL;
+    struct pl_frame target = custom_mix_frame(dst);
+    // Even an uninitialized state's empty render protects callback reentry.
+    struct source_time_reentry reentry = {
+        .rr = rr, .state = state, .source = &native[0], .params = &peak,
+    };
+    struct pl_frame guarded_target = target;
+    guarded_target.acquire = source_time_acquire;
+    guarded_target.release = source_time_release;
+    guarded_target.user_data = &reentry;
+    struct pl_source_peak_context uninitialized = {.state = state};
+    REQUIRE(pl_render_image_source(rr, NULL, &guarded_target, &params, &uninitialized));
+    REQUIRE(reentry.acquired == 1 && reentry.released == 1);
+    const uint64_t ids[] = {10, 40, 90};
+    for (int i = 0; i < 3; i++)
+        REQUIRE(pl_source_peak_submit(rr, state, 1, ids[i], &native[i], &peak) >= 0);
+    uint64_t view_id = 10;
+    struct pl_source_peak_context context = {
+        .state = state, .epoch = 1, .ids = &view_id, .current_id = 10,
+    };
+    float actual[32 * 32 * 4], expected[32 * 32 * 4], previous[32 * 32 * 4];
+    // The native identity selects metadata, not a cache key for materialized pixels.
+    for (int i = 0; i < 2; i++) {
+        struct pl_frame view = native[i];
+        view.acquire = NULL;
+        view.release = NULL;
+        REQUIRE(pl_render_image_source(rr, &view, &target, &params, &context));
+        custom_mix_download(gpu, dst, actual);
+        REQUIRE(pl_source_peak_get_hdr_metadata(state, 1, view_id, &view.color.hdr));
+        struct pl_render_params reference = params;
+        reference.peak_detect_params = NULL;
+        REQUIRE(pl_render_image(oracle, &view, &target, &reference));
+        custom_mix_download(gpu, dst, expected);
+        custom_mix_compare(actual, expected, 32 * 32 * 4);
+        if (i) {
+            float difference = 0;
+            for (int j = 0; j < 32 * 32 * 4; j++)
+                difference = PL_MAX(difference, fabsf(actual[j] - previous[j]));
+            REQUIRE(difference > .003f);
+        }
+        memcpy(previous, actual, sizeof(previous));
+    }
+    // Distinguish the view's snapshot from the public current-source snapshot.
+    // Fixed HDR pixels include sub-peak values and highlights above the low
+    // source peak. Prove both oracle outputs differ before testing the API.
+    float materialized[32 * 32 * 4];
+    const float levels[] = {.05f, .2f, .5f, 4};
+    for (int i = 0; i < 32 * 32; i++) {
+        for (int c = 0; c < 3; c++)
+            materialized[4*i+c] = levels[(i % 32) / 8];
+        materialized[4*i+3] = 1;
+    }
+    pl_tex materialized_tex = pl_tex_create(gpu, pl_tex_params(
+        .w = 32, .h = 32, .format = dst->params.format,
+        .sampleable = true, .initial_data = materialized));
+    REQUIRE(materialized_tex);
+    struct pl_frame fixed = native[1], dim_target = target;
+    fixed.planes[0].texture = materialized_tex;
+    fixed.acquire = NULL;
+    fixed.release = NULL;
+    dim_target.color.hdr.max_luma = 50;
+    struct pl_render_params reference = params;
+    reference.peak_detect_params = NULL;
+    struct pl_frame view_reference = fixed, wrong_reference = fixed;
+    REQUIRE(sh_peak_metadata(&after[0], &view_reference.color.hdr));
+    REQUIRE(sh_peak_metadata(&after[1], &wrong_reference.color.hdr));
+    REQUIRE(pl_render_image(oracle, &view_reference, &dim_target, &reference));
+    custom_mix_download(gpu, dst, expected);
+    REQUIRE(pl_render_image(oracle, &wrong_reference, &dim_target, &reference));
+    custom_mix_download(gpu, dst, previous);
+    float snapshot_difference = 0;
+    for (int i = 0; i < 32 * 32 * 4; i++) {
+        REQUIRE(isfinite(expected[i]) && isfinite(previous[i]));
+        snapshot_difference = PL_MAX(snapshot_difference, fabsf(expected[i] - previous[i]));
+    }
+    printf("direct source-time view/current oracle difference=%g\n", snapshot_difference);
+    fflush(stdout);
+    REQUIRE(snapshot_difference > .003f);
+    context.current_id = 40;
+    REQUIRE(pl_render_image_source(rr, &fixed, &dim_target, &params, &context));
+    custom_mix_download(gpu, dst, actual);
+    custom_mix_compare(actual, expected, 32 * 32 * 4);
+    float wrong_difference = 0;
+    for (int i = 0; i < 32 * 32 * 4; i++)
+        wrong_difference = PL_MAX(wrong_difference, fabsf(actual[i] - previous[i]));
+    REQUIRE(wrong_difference > .003f);
+    struct pl_hdr_metadata public_current = {0}, expected_current = {0};
+    REQUIRE(pl_renderer_get_hdr_metadata(rr, &public_current));
+    REQUIRE(sh_peak_metadata(&after[1], &expected_current));
+    peak_record_metadata_equal(&public_current, &expected_current);
+    pl_tex_destroy(gpu, &materialized_tex);
+
+    view_id = 90;
+    context.current_id = 40;
+    REQUIRE(pl_render_image_source(rr, &native[2], &target, &params, &context));
+    struct pl_hdr_metadata observed = {0}, current = {0};
+    REQUIRE(pl_renderer_get_hdr_metadata(rr, &observed));
+    REQUIRE(sh_peak_metadata(&after[1], &current));
+    peak_record_metadata_equal(&observed, &current);
+    source_time_expect(state, 1, 90, &after[2]);
+
+    // Neither failed acquisition nor target rendering may advance or retire A.
+    struct custom_mix_owner failure = {.fail = true};
+    struct pl_frame failed = native[2];
+    failed.user_data = &failure;
+    context.current_id = 90;
+    context.retire_before_id = 40;
+    REQUIRE(!pl_render_image_source(rr, &failed, &target, &params, &context));
+    REQUIRE(failure.acquired == 1 && failure.released == 1 && !failure.active);
+    struct pl_frame failed_target = target;
+    failed_target.acquire = custom_mix_acquire;
+    failed_target.release = custom_mix_release;
+    failed_target.user_data = &failure;
+    REQUIRE(!pl_render_image_source(rr, &native[2], &failed_target, &params, &context));
+    REQUIRE(failure.acquired == 2 && failure.released == 2 && !failure.active);
+    REQUIRE(pl_renderer_get_hdr_metadata(rr, &observed));
+    peak_record_metadata_equal(&observed, &current);
+    source_time_expect(state, 1, 10, &after[0]);
+    context.current_id = 40;
+    context.retire_before_id = 0;
+    view_id = 10;
+    REQUIRE(pl_render_image_source(rr, &native[0], &target, &params, &context));
+
+    // Empty views report no metadata and ignore clock/IDs without committing.
+    struct pl_source_peak_context empty_context = {.state = state};
+    REQUIRE(!pl_render_image_source(rr, NULL, &failed_target, &params, &empty_context));
+    REQUIRE(pl_renderer_get_hdr_metadata(rr, &observed));
+    peak_record_metadata_equal(&observed, &current);
+    REQUIRE(pl_render_image_source(rr, NULL, &target, &params, &empty_context));
+    REQUIRE(!pl_renderer_get_hdr_metadata(rr, &observed));
+    REQUIRE(pl_render_image_source(rr, &native[0], &target, &params, &context));
+    struct pl_frame_mix empty_mix = {0};
+    REQUIRE(pl_render_image_mix_source(rr, &empty_mix, &target, &params,
+                                       &empty_context, NULL));
+    REQUIRE(!pl_renderer_get_hdr_metadata(rr, &observed));
+    source_time_expect(state, 1, 10, &after[0]);
+
+    view_id = 90;
+    context.retire_before_id = 50; // exceeds current B
+    REQUIRE(!pl_render_image_source(rr, &native[2], &target, &params, &context));
+    context.current_id = 90;
+    context.retire_before_id = 40;
+    REQUIRE(pl_render_image_source(rr, &native[2], &target, &params, &context));
+    REQUIRE(!pl_source_peak_get_hdr_metadata(state, 1, 10, &observed));
+    context.current_id = 40;
+    REQUIRE(!pl_render_image_source(rr, &native[2], &target, &params, &context));
+
+    // An unsupported view uses ordinary rendering, but cannot leak legacy peaks.
+    struct pl_frame hlg = native[1];
+    hlg.color.transfer = PL_COLOR_TRC_HLG;
+    hlg.acquire = NULL;
+    hlg.release = NULL;
+    REQUIRE(pl_source_peak_submit(rr, state, 1, 120, &hlg, &peak) ==
+            PL_SOURCE_PEAK_UNSUPPORTED);
+    view_id = context.current_id = 120;
+    REQUIRE(pl_render_image_source(rr, &hlg, &target, &params, &context));
+    custom_mix_download(gpu, dst, actual);
+    pl_renderer_flush_cache(oracle);
+    REQUIRE(pl_render_image(oracle, &hlg, &target, &params));
+    custom_mix_download(gpu, dst, expected);
+    custom_mix_compare(actual, expected, 32 * 32 * 4);
+    REQUIRE(!pl_renderer_get_hdr_metadata(rr, &observed));
+    REQUIRE(!pl_source_peak_get_hdr_metadata(state, 1, 120, &observed));
+    REQUIRE(pl_render_image_source(rr, NULL, &target, &params, &empty_context));
+    hlg.planes[0].texture = native[0].planes[0].texture;
+    REQUIRE(pl_source_peak_submit(rr, state, 1, 140, &hlg, &peak) ==
+            PL_SOURCE_PEAK_UNSUPPORTED);
+    view_id = context.current_id = 140;
+    REQUIRE(pl_render_image_source(rr, &hlg, &target, &params, &context));
+    custom_mix_download(gpu, dst, actual);
+    REQUIRE(pl_render_image(oracle, &hlg, &target, &params));
+    custom_mix_download(gpu, dst, expected);
+    custom_mix_compare(actual, expected, 32 * 32 * 4);
+    REQUIRE(!pl_renderer_get_hdr_metadata(rr, &observed));
+    pl_renderer_destroy(&rr);
+    pl_renderer_destroy(&oracle);
+    pl_source_peak_state_destroy(&state);
+    printf("- direct source-time pixels, clock, failure, empty and boundary passed\n");
+}
+
+static void source_time_tests(pl_gpu gpu)
+{
+    pl_fmt fmt = pl_find_fmt(gpu, PL_FMT_FLOAT, 4, 32, 32,
+        PL_FMT_CAP_SAMPLEABLE | PL_FMT_CAP_RENDERABLE | PL_FMT_CAP_HOST_READABLE |
+        PL_FMT_CAP_BLITTABLE);
+    if (!fmt || !gpu->glsl.compute || !gpu->limits.max_ssbo_size)
+        return;
+    printf("source_time_tests: LP source-clock API, not VO integration\n");
+    fflush(stdout);
+    pl_renderer rr = pl_renderer_create(gpu->log, gpu);
+    pl_source_peak_state state = pl_source_peak_state_create(gpu->log, gpu);
+    pl_dispatch dispatch = pl_dispatch_create(gpu->log, gpu);
+    REQUIRE(rr && state && dispatch);
+    struct pl_peak_detect_params peak = pl_peak_detect_default_params;
+    peak.smoothing_period = 3;
+    peak.scene_threshold_low = peak.scene_threshold_high = 0;
+    peak.percentile = 97;
+    peak.black_cutoff = 2;
+    peak.allow_delayed = false;
+    float pixels[32 * 32 * 4];
+    const float levels[] = {.1f, 4, .2f};
+    const uint64_t all_ids[] = {10, 40, 90}; // gaps are not missing samples
+    pl_tex textures[3] = {0};
+    struct pl_frame native[3];
+    struct custom_mix_owner owners[3] = {0};
+    struct sh_peak_result raw[3], after[3], history = {0};
+    for (int n = 0; n < 3; n++) {
+        for (int y = 0; y < 32; y++) {
+            for (int x = 0; x < 32; x++) {
+                int i = 4 * (32*y+x);
+                for (int c = 0; c < 3; c++)
+                    pixels[i+c] = x < 16 && y < 16 ? levels[n] : 0;
+                pixels[i+3] = 1;
+            }
+        }
+        textures[n] = pl_tex_create(gpu, pl_tex_params(
+            .w = 32, .h = 32, .format = fmt, .sampleable = true,
+            .initial_data = pixels));
+        REQUIRE(textures[n]);
+        native[n] = custom_mix_frame(textures[n]);
+        native[n].color = pl_color_space_hdr10;
+        native[n].color.transfer = PL_COLOR_TRC_LINEAR_HDR;
+        native[n].acquire = custom_mix_acquire;
+        native[n].release = custom_mix_release;
+        native[n].user_data = &owners[n];
+        pl_shader_obj measurement = NULL;
+        pl_shader sh = peak_record_shader(dispatch, textures[n], 1);
+        REQUIRE(sh_measure_peak(sh, native[n].color, &measurement, &peak));
+        REQUIRE(pl_dispatch_compute(dispatch, pl_dispatch_compute_params(
+            .shader = &sh, .width = 32, .height = 32)));
+        REQUIRE(sh_get_peak_measurement(measurement, true, &raw[n]) == SH_PEAK_READY);
+        sh_peak_smooth(&history, &raw[n], &peak);
+        after[n] = history;
+        pl_shader_obj_destroy(&measurement);
+    }
+    pl_tex dst = pl_tex_create(gpu, pl_tex_params(
+        .w = 32, .h = 32, .format = fmt, .renderable = true,
+        .host_readable = true, .blit_dst = true));
+    REQUIRE(dst);
+    struct pl_frame target = custom_mix_frame(dst);
+    struct pl_frame views[3] = {native[0], native[1], native[2]};
+    const struct pl_frame *frames[3] = {&views[0], &views[2], &views[2]};
+    uint64_t ids[3] = {10, 90, 90}, signatures[3] = {700, 1100, 1100};
+    double timestamps[3] = {-.25, 1.75, 2.75};
+    struct pl_frame_mix mix = {
+        .num_frames = 2, .frames = frames, .signatures = signatures,
+        .timestamps = timestamps, .vsync_duration = 1,
+    };
+    struct custom_mix_test custom = {
+        .gpu = gpu, .dispatch = dispatch, .count = 2, .timestamps = timestamps,
+    };
+    struct pl_custom_frame_mixer mixer = {.priv = &custom, .mix = custom_mix_callback};
+    struct pl_source_peak_context context = {
+        .state = state, .epoch = 1, .ids = ids, .current_id = 10,
+    };
+    struct source_time_info info = {0};
+    struct pl_color_map_params mapping = pl_color_map_default_params;
+    mapping.mastering_clip = 0;
+    struct pl_render_params params = pl_render_default_params;
+    params.peak_detect_params = &peak;
+    params.color_map_params = &mapping;
+    params.dither_params = NULL;
+    params.skip_caching_single_frame = true;
+    params.frame_mixer = NULL;
+    params.info_callback = source_time_info_cb;
+    params.info_priv = &info;
+    // Submit A and C first, then discover B without ever presenting past A.
+    for (int n = 0; n < 3; n += 2) {
+        REQUIRE(pl_source_peak_submit(rr, state, 1, all_ids[n], &native[n], &peak) >= 0);
+        REQUIRE(owners[n].acquired == 1 && owners[n].released == 1);
+        REQUIRE(pl_source_peak_submit(rr, state, 1, all_ids[n], &native[n], &peak) >= 0);
+        REQUIRE(owners[n].acquired == 1 && owners[n].released == 1);
+    }
+    REQUIRE(pl_render_image_mix_source(rr, &mix, &target, &params, &context, NULL));
+    REQUIRE(info.frames > 0 && info.blends == 0 && custom.calls == 0);
+    source_time_expect(state, 1, 10, &after[0]);
+    // Nearest-neighbour A must not wait for or latch the unused future C.
+    struct pl_hdr_metadata unused = {0};
+    REQUIRE(!pl_source_peak_get_hdr_metadata(state, 1, 90, &unused));
+    int future_acquired = owners[2].acquired;
+    REQUIRE(pl_source_peak_submit(rr, state, 1, 90, &native[2], &peak) ==
+            PL_SOURCE_PEAK_PENDING);
+    REQUIRE(owners[2].acquired == future_acquired &&
+            owners[2].released == future_acquired);
+    REQUIRE(pl_render_image_mix_source(rr, &mix, &target, &params, &context, &mixer));
+    REQUIRE(pl_source_peak_submit(rr, state, 1, 90, &native[2], &peak) ==
+            PL_SOURCE_PEAK_READY);
+    struct sh_peak_result ac = after[0];
+    sh_peak_smooth(&ac, &raw[2], &peak);
+    source_time_expect(state, 1, 90, &ac);
+    uint64_t c_view = custom.ids[1];
+    REQUIRE(pl_source_peak_submit(rr, state, 1, 40, &native[1], &peak) >= 0);
+    REQUIRE(owners[1].acquired == 1 && owners[1].released == 1);
+    frames[1] = &views[1]; frames[2] = &views[2];
+    ids[1] = 40; ids[2] = 90;
+    signatures[1] = 900; // C retains its render signature across insertion
+    mix.num_frames = custom.count = 3;
+    timestamps[1] = .75;
+    REQUIRE(pl_render_image_mix_source(rr, &mix, &target, &params, &context, &mixer));
+    source_time_expect(state, 1, 10, &after[0]);
+    source_time_expect(state, 1, 90, &after[2]);
+    REQUIRE(custom.ids[2] != c_view);
+    custom.blend = true;
+    for (int phase = 0; phase < 2; phase++) {
+        custom.alpha = phase ? .75f : .25f;
+        REQUIRE(pl_render_image_mix_source(rr, &mix, &target, &params, &context, &mixer));
+        source_time_expect(state, 1, 10, &after[0]);
+    }
+    custom.blend = false;
+    REQUIRE(pl_render_image_mix_source(rr, &mix, &target, &params, &context, NULL));
+    // View crop is applied after native measurement. Rebuilds and parameter
+    // changes must not submit another temporal sample or consume native output.
+    struct pl_color_adjustment adjustment = pl_color_adjustment_neutral;
+    adjustment.brightness = .02f;
+    for (int change = 0; change < 6; change++) {
+        switch (change) {
+        case 0: pl_renderer_flush_cache(rr); break;
+        case 1: pl_renderer_reset(rr); break;
+        case 2: target.color.transfer = PL_COLOR_TRC_BT_1886; break;
+        case 3: target.color.hdr.max_luma = 100; break;
+        case 4: views[0].crop = (pl_rect2df){2, 1, 30, 31}; break;
+        case 5: params.color_adjustment = &adjustment; break;
+        }
+        REQUIRE(pl_render_image_mix_source(rr, &mix, &target, &params, &context, &mixer));
+        source_time_expect(state, 1, 10, &after[0]);
+        for (int n = 0; n < 3; n++) {
+            int count = owners[n].acquired;
+            REQUIRE(pl_source_peak_submit(rr, state, 1, all_ids[n], &native[n], &peak) >= 0);
+            REQUIRE(owners[n].acquired == count && owners[n].released == count);
+        }
+    }
+    mix.num_frames = custom.count = 1;
+    REQUIRE(pl_render_image_mix_source(rr, &mix, &target, &params, &context, &mixer));
+    mix.num_frames = custom.count = 3;
+    REQUIRE(pl_render_image_mix_source(rr, &mix, &target, &params, &context, &mixer));
+    source_time_expect(state, 1, 90, &after[2]);
+    // A failed attempt to present B must not commit/prune A.
+    context.current_id = 40;
+    custom.fail = true;
+    REQUIRE(!pl_render_image_mix_source(rr, &mix, &target, &params, &context, &mixer));
+    custom.fail = false;
+    context.current_id = 10;
+    REQUIRE(pl_render_image_mix_source(rr, &mix, &target, &params, &context, &mixer));
+    source_time_expect(state, 1, 10, &after[0]);
+    uint64_t old_view = custom.ids[0];
+    peak.allow_delayed = true;
+    REQUIRE(pl_source_peak_submit(rr, state, 1, 10, &native[0], &peak) >= 0);
+    REQUIRE(pl_render_image_mix_source(rr, &mix, &target, &params, &context, &mixer));
+    REQUIRE(custom.ids[0] != old_view);
+    struct pl_hdr_metadata empty = {0};
+    REQUIRE(!pl_source_peak_get_hdr_metadata(state, 1, 10, &empty));
+    source_time_expect(state, 1, 40, &after[0]);
+    source_time_expect(state, 1, 90, &after[1]);
+    peak.allow_delayed = false;
+    REQUIRE(pl_source_peak_submit(rr, state, 1, 10, &native[0], &peak) >= 0);
+    REQUIRE(pl_render_image_mix_source(rr, &mix, &target, &params, &context, &mixer));
+    source_time_expect(state, 1, 10, &after[0]);
+    context.current_id = 40;
+    REQUIRE(pl_render_image_mix_source(rr, &mix, &target, &params, &context, &mixer));
+    source_time_expect(state, 1, 40, &after[1]);
+    // After advancing, render a suffix: retired IDs need not remain queryable.
+    frames[0] = &views[2]; ids[0] = 90; signatures[0] = 1200;
+    timestamps[0] = -.25; mix.num_frames = custom.count = 1;
+    context.current_id = 90;
+    REQUIRE(pl_render_image_mix_source(rr, &mix, &target, &params, &context, NULL));
+    source_time_expect(state, 1, 90, &after[2]);
+    REQUIRE(pl_source_peak_state_reset(state, 2));
+    REQUIRE(!pl_source_peak_get_hdr_metadata(state, 1, 90, &empty));
+    context.epoch = 2; context.current_id = ids[0] = 10; frames[0] = &views[0];
+    int acquired = owners[0].acquired;
+    REQUIRE(pl_source_peak_submit(rr, state, 2, 10, &native[0], &peak) >= 0);
+    REQUIRE(owners[0].acquired == acquired + 1 && owners[0].released == acquired + 1);
+    REQUIRE(pl_render_image_mix_source(rr, &mix, &target, &params, &context, &mixer));
+    source_time_expect(state, 2, 10, &after[0]);
+    REQUIRE(custom.ids[0] != old_view);
+
+    struct custom_mix_owner failure = {.fail = true};
+    struct pl_frame bad = native[0];
+    bad.user_data = &failure;
+    REQUIRE(pl_source_peak_submit(rr, state, 2, 100, &bad, &peak) == PL_SOURCE_PEAK_ERROR);
+    REQUIRE(failure.acquired == 1 && failure.released == 1);
+    failure.fail = false;
+    REQUIRE(pl_source_peak_submit(rr, state, 2, 100, &bad, &peak) == PL_SOURCE_PEAK_ERROR);
+    REQUIRE(failure.acquired == 1 && failure.released == 1);
+    REQUIRE(pl_source_peak_state_reset(state, 3));
+    bad.color.transfer = PL_COLOR_TRC_HLG;
+    REQUIRE(pl_source_peak_submit(rr, state, 3, 10, &bad, &peak) == PL_SOURCE_PEAK_UNSUPPORTED);
+    bad = native[0];
+    bad.field = bad.first_field = PL_FIELD_TOP;
+    REQUIRE(pl_source_peak_submit(rr, state, 3, 20, &bad, &peak) == PL_SOURCE_PEAK_UNSUPPORTED);
+    acquired = owners[0].acquired;
+    REQUIRE(pl_source_peak_submit(rr, state, 4, 10, NULL, NULL) == PL_SOURCE_PEAK_READY);
+    REQUIRE(pl_source_peak_submit(rr, state, 4, 10, &native[0], NULL) == PL_SOURCE_PEAK_READY);
+    REQUIRE(pl_source_peak_submit(rr, state, 4, 20, NULL, NULL) == PL_SOURCE_PEAK_READY);
+    REQUIRE(pl_source_peak_submit(rr, state, 4, 20, NULL, NULL) == PL_SOURCE_PEAK_READY);
+    REQUIRE(owners[0].acquired == acquired && owners[0].released == acquired);
+    REQUIRE(!pl_source_peak_get_hdr_metadata(state, 3, 10, &empty));
+    // Invalid enabled submissions cannot change policy, epoch or retained IDs.
+    REQUIRE(pl_source_peak_submit(rr, state, 4, 10, NULL, &peak) == PL_SOURCE_PEAK_ERROR);
+    REQUIRE(pl_source_peak_submit(rr, state, 99, 30, NULL, &peak) == PL_SOURCE_PEAK_ERROR);
+    REQUIRE(pl_source_peak_submit(rr, state, 4, 0, NULL, NULL) == PL_SOURCE_PEAK_ERROR);
+    struct pl_render_params disabled_params = params;
+    disabled_params.peak_detect_params = NULL;
+    uint64_t disabled_id = 10;
+    struct pl_source_peak_context disabled_context = {
+        .state = state, .epoch = 4, .ids = &disabled_id, .current_id = 10,
+    };
+    REQUIRE(pl_render_image_source(rr, &native[0], &target, &disabled_params,
+                                   &disabled_context));
+    REQUIRE(owners[0].acquired == acquired + 1 && owners[0].released == acquired + 1);
+    REQUIRE(!pl_renderer_get_hdr_metadata(rr, &empty));
+    REQUIRE(!pl_source_peak_get_hdr_metadata(state, 4, 10, &empty));
+    disabled_id = 20;
+    int disabled_acquired = owners[1].acquired;
+    REQUIRE(pl_render_image_source(rr, &native[1], &target, &disabled_params,
+                                   &disabled_context));
+    REQUIRE(owners[1].acquired == disabled_acquired + 1 &&
+            owners[1].released == disabled_acquired + 1);
+    REQUIRE(!pl_renderer_get_hdr_metadata(rr, &empty));
+    REQUIRE(!pl_source_peak_get_hdr_metadata(state, 4, 20, &empty));
+    // Enabling measurement for the same ID must acquire the actual source.
+    acquired = owners[0].acquired;
+    REQUIRE(pl_source_peak_submit(rr, state, 4, 10, &native[0], &peak) >= 0);
+    REQUIRE(owners[0].acquired == acquired + 1 && owners[0].released == acquired + 1);
+    REQUIRE(pl_source_peak_submit(rr, state, 4, 10, &native[0], &peak) >= 0);
+    REQUIRE(owners[0].acquired == acquired + 1 && owners[0].released == acquired + 1);
+    disabled_id = 10;
+    REQUIRE(pl_render_image_source(rr, &native[0], &target, &params, &disabled_context));
+    REQUIRE(owners[0].acquired == acquired + 2 && owners[0].released == acquired + 2);
+    source_time_expect(state, 4, 10, &after[0]);
+    REQUIRE(pl_source_peak_state_reset(state, 5));
+    struct source_time_reentry reentry = {
+        .rr = rr, .state = state, .source = &native[0], .params = &peak,
+    };
+    bad = native[0];
+    bad.acquire = source_time_acquire;
+    bad.release = source_time_release;
+    bad.user_data = &reentry;
+    REQUIRE(pl_source_peak_submit(rr, state, 5, 10, &bad, &peak) >= 0);
+    REQUIRE(reentry.acquired == 1 && reentry.released == 1);
+    REQUIRE(pl_source_peak_submit(rr, state, 5, 10, &bad, &peak) >= 0);
+    REQUIRE(reentry.acquired == 1 && reentry.released == 1);
+    context.epoch = 5;
+    REQUIRE(pl_render_image_mix_source(rr, &mix, &target, &params, &context, NULL));
+    source_time_expect(state, 5, 10, &after[0]);
+    bad = native[0];
+    bad.profile = (struct pl_icc_profile){.data = "invalid ICC", .len = 11};
+    acquired = owners[0].acquired;
+    REQUIRE(pl_source_peak_submit(rr, state, 5, 100, &bad, &peak) == PL_SOURCE_PEAK_UNSUPPORTED);
+    REQUIRE(owners[0].acquired == acquired + 1 && owners[0].released == acquired + 1);
+    source_time_expect(state, 5, 10, &after[0]);
+    // Oversample uses B and C. A failed used-source measurement must not be
+    // swallowed by the legacy frame-mixer fallback or commit current B.
+    REQUIRE(pl_source_peak_state_reset(state, 6));
+    REQUIRE(pl_source_peak_submit(rr, state, 6, 10, &native[0], &peak) >= 0);
+    REQUIRE(pl_source_peak_submit(rr, state, 6, 40, &native[1], &peak) >= 0);
+    struct custom_mix_owner failed_future = {.fail = true};
+    struct pl_frame failed_source = native[2];
+    failed_source.user_data = &failed_future;
+    REQUIRE(pl_source_peak_submit(rr, state, 6, 90, &failed_source, &peak) ==
+            PL_SOURCE_PEAK_ERROR);
+    REQUIRE(failed_future.acquired == 1 && failed_future.released == 1);
+    const struct pl_frame *failure_frames[] = {&native[0], &native[1], &failed_source};
+    uint64_t failure_ids[] = {10, 40, 90};
+    uint64_t failure_signatures[] = {1800, 1801, 1802};
+    double failure_times[] = {-1.25, -.25, .75};
+    struct pl_frame_mix failure_mix = {
+        .num_frames = 3, .frames = failure_frames, .signatures = failure_signatures,
+        .timestamps = failure_times, .vsync_duration = 1,
+    };
+    struct pl_source_peak_context failure_context = {
+        .state = state, .epoch = 6, .ids = failure_ids, .current_id = 40,
+    };
+    struct pl_render_params failure_params = params;
+    failure_params.frame_mixer = &pl_filter_oversample;
+    REQUIRE(!(pl_renderer_get_errors(rr).errors & PL_RENDER_ERR_FRAME_MIXING));
+    REQUIRE(!pl_render_image_mix_source(rr, &failure_mix, &target, &failure_params,
+                                       &failure_context, NULL));
+    REQUIRE(!(pl_renderer_get_errors(rr).errors & PL_RENDER_ERR_FRAME_MIXING));
+    REQUIRE(failed_future.acquired == 1 && failed_future.released == 1);
+    REQUIRE(pl_source_peak_submit(rr, state, 6, 90, &failed_source, &peak) ==
+            PL_SOURCE_PEAK_ERROR);
+    REQUIRE(failed_future.acquired == 1 && failed_future.released == 1);
+    failure_mix.num_frames = 1;
+    failure_times[0] = 0;
+    failure_context.current_id = 10;
+    failure_params.frame_mixer = NULL;
+    REQUIRE(pl_render_image_mix_source(rr, &failure_mix, &target, &failure_params,
+                                      &failure_context, NULL));
+    source_time_expect(state, 6, 10, &after[0]);
+    // Logical source events are independent of visible phase/nearest source.
+    // Retention is explicit: shrinking a mix must not retire older snapshots.
+    REQUIRE(pl_source_peak_state_reset(state, 7));
+    for (int n = 0; n < 3; n++)
+        REQUIRE(pl_source_peak_submit(rr, state, 7, all_ids[n], &native[n], &peak) >= 0);
+    const struct pl_frame *clock_frames[] = {&native[2], &native[2]};
+    uint64_t clock_ids[] = {90, 90};
+    uint64_t clock_signatures[] = {1902, 1902};
+    double clock_times[] = {0, .75};
+    struct pl_frame_mix clock_mix = {
+        .num_frames = 1, .frames = clock_frames, .signatures = clock_signatures,
+        .timestamps = clock_times, .vsync_duration = 1,
+    };
+    struct pl_source_peak_context clock_context = {
+        .state = state, .epoch = 7, .ids = clock_ids, .current_id = 10,
+        .retire_before_id = 0,
+    };
+    REQUIRE(pl_render_image_mix_source(rr, &clock_mix, &target, &params,
+                                      &clock_context, NULL));
+    source_time_expect(state, 7, 10, &after[0]);
+    source_time_expect(state, 7, 90, &after[2]);
+    clock_frames[0] = &native[0];
+    clock_ids[0] = 10;
+    clock_signatures[0] = 1900;
+    REQUIRE(pl_render_image_mix_source(rr, &clock_mix, &target, &params,
+                                      &clock_context, NULL));
+    source_time_expect(state, 7, 10, &after[0]);
+    // Advancing the logical event to B may still display A (negative offset),
+    // without forcing a rollback of the source clock.
+    clock_context.current_id = 40;
+    clock_frames[0] = &native[2];
+    clock_ids[0] = 90;
+    clock_signatures[0] = 1902;
+    REQUIRE(pl_render_image_mix_source(rr, &clock_mix, &target, &params,
+                                      &clock_context, NULL));
+    // A is now committed, but a future-only view is not a retirement request.
+    source_time_expect(state, 7, 10, &after[0]);
+    clock_frames[0] = &native[0];
+    clock_ids[0] = 10;
+    clock_signatures[0] = 1900;
+    REQUIRE(pl_render_image_mix_source(rr, &clock_mix, &target, &params,
+                                      &clock_context, NULL));
+    source_time_expect(state, 7, 40, &after[1]);
+    source_time_expect(state, 7, 10, &after[0]);
+    clock_context.retire_before_id = 40; // legal relative to current, not visible A
+    REQUIRE(!pl_render_image_mix_source(rr, &clock_mix, &target, &params,
+                                       &clock_context, NULL));
+    source_time_expect(state, 7, 10, &after[0]);
+    clock_frames[0] = &native[1];
+    clock_ids[0] = 40;
+    clock_signatures[0] = 1901;
+    clock_times[0] = -.25;
+    clock_mix.num_frames = 1;
+    clock_frames[0] = &native[2];
+    clock_ids[0] = 90;
+    clock_signatures[0] = 1902;
+    clock_times[0] = 0;
+    clock_context.retire_before_id = 50; // <= visible C, but greater than current B
+    REQUIRE(!pl_render_image_mix_source(rr, &clock_mix, &target, &params,
+                                       &clock_context, NULL));
+    clock_frames[0] = &native[1];
+    clock_ids[0] = 40;
+    clock_signatures[0] = 1901;
+    clock_times[0] = -.25;
+    clock_mix.num_frames = 2;
+    // Failure while attempting current C must neither advance from B nor
+    // retire A, even though the requested retirement boundary is valid.
+    struct custom_mix_test clock_custom = {
+        .gpu = gpu, .dispatch = dispatch, .count = 2,
+        .timestamps = clock_times, .fail = true,
+    };
+    struct pl_custom_frame_mixer clock_mixer = {
+        .priv = &clock_custom, .mix = custom_mix_callback,
+    };
+    clock_context.current_id = 90;
+    clock_context.retire_before_id = 40;
+    REQUIRE(!pl_render_image_mix_source(rr, &clock_mix, &target, &params,
+                                       &clock_context, &clock_mixer));
+    REQUIRE(clock_custom.calls == 1);
+    source_time_expect(state, 7, 10, &after[0]);
+    clock_context.current_id = 40;
+    clock_context.retire_before_id = 0;
+    clock_mix.num_frames = 1;
+    clock_frames[0] = &native[0];
+    clock_ids[0] = 10;
+    clock_signatures[0] = 1900;
+    clock_times[0] = 0;
+    REQUIRE(pl_render_image_mix_source(rr, &clock_mix, &target, &params,
+                                      &clock_context, NULL));
+    source_time_expect(state, 7, 10, &after[0]);
+    clock_frames[0] = &native[1];
+    clock_ids[0] = 40;
+    clock_signatures[0] = 1901;
+    clock_times[0] = -.25;
+    clock_mix.num_frames = 2;
+    clock_custom.fail = false;
+    clock_context.retire_before_id = 40;
+    REQUIRE(pl_render_image_mix_source(rr, &clock_mix, &target, &params,
+                                      &clock_context, &clock_mixer));
+    REQUIRE(!pl_source_peak_get_hdr_metadata(state, 7, 10, &empty));
+    source_time_expect(state, 7, 40, &after[1]);
+    source_time_expect(state, 7, 90, &after[2]);
+    source_time_pixels(gpu, rr, dispatch, dst, &native[0], &native[1]);
+    source_time_image(gpu, dst, native, after);
+    pl_renderer_destroy(&rr);
+    pl_source_peak_state_destroy(&state);
+    pl_tex_destroy(gpu, &custom.output);
+    pl_dispatch_destroy(&dispatch);
+    for (int n = 0; n < 3; n++) pl_tex_destroy(gpu, &textures[n]);
+    pl_tex_destroy(gpu, &dst);
+    printf("- source-time ownership, prefixes, delay, failure and epochs passed\n");
+}
+
+static void source_time_boundary_tests(pl_gpu gpu)
+{
+    pl_fmt fmt = pl_find_fmt(gpu, PL_FMT_FLOAT, 4, 32, 32,
+        PL_FMT_CAP_SAMPLEABLE | PL_FMT_CAP_RENDERABLE | PL_FMT_CAP_HOST_READABLE);
+    if (!fmt || !gpu->glsl.compute || !gpu->limits.max_ssbo_size) {
+        puts("Source boundary GPU capability unavailable: not run");
+        return;
+    }
+    const uint64_t ids[] = {10, 20, 30, 40, 45, 50, 60};
+    const bool hlg[] = {false, true, true, false, false, true, true};
+    const float level[] = {.1f, .85f, 1.0f, .2f, .4f, .95f, .8f};
+    float pixels[32 * 32 * 4], actual[32 * 32 * 4], expected[32 * 32 * 4];
+    pl_tex textures[7] = {0};
+    struct pl_frame sources[7];
+    struct custom_mix_owner owners[7] = {0};
+    for (int n = 0; n < 7; n++) {
+        for (int y = 0; y < 32; y++) {
+            for (int x = 0; x < 32; x++) {
+                for (int c = 0; c < 3; c++)
+                    pixels[(y * 32 + x) * 4 + c] =
+                        level[n] * (.1f + .9f * x / 31);
+                pixels[(y * 32 + x) * 4 + 3] = 1;
+            }
+        }
+        textures[n] = pl_tex_create(gpu, pl_tex_params(
+            .w = 32, .h = 32, .format = fmt, .sampleable = true,
+            .initial_data = pixels));
+        REQUIRE(textures[n]);
+        sources[n] = custom_mix_frame(textures[n]);
+        sources[n].color = pl_color_space_hdr10;
+        sources[n].color.transfer = hlg[n] ? PL_COLOR_TRC_HLG : PL_COLOR_TRC_LINEAR_HDR;
+        sources[n].color.hdr.max_luma = 1000;
+        sources[n].acquire = custom_mix_acquire;
+        sources[n].release = custom_mix_release;
+        sources[n].user_data = &owners[n];
+    }
+    pl_tex dst = pl_tex_create(gpu, pl_tex_params(
+        .w = 32, .h = 32, .format = fmt, .renderable = true, .host_readable = true));
+    REQUIRE(dst);
+    struct pl_frame target = custom_mix_frame(dst);
+    // Keep both HLG segments above the display range, so smoothing changes
+    // the tone curve rather than comparing two uncompressed SDR-range views.
+    target.color.hdr.max_luma = 50;
+    pl_dispatch dispatch = pl_dispatch_create(gpu->log, gpu);
+    REQUIRE(dispatch);
+    for (int delayed = 0; delayed < 2; delayed++) {
+        pl_renderer rr = pl_renderer_create(gpu->log, gpu);
+        pl_source_peak_state state = pl_source_peak_state_create(gpu->log, gpu);
+        REQUIRE(rr && state);
+        struct pl_peak_detect_params peak = pl_peak_detect_default_params;
+        peak.smoothing_period = 3;
+        peak.scene_threshold_low = peak.scene_threshold_high = 0;
+        peak.percentile = 97;
+        peak.black_cutoff = 2;
+        peak.allow_delayed = delayed;
+        struct pl_color_map_params mapping = pl_color_map_default_params;
+        mapping.mastering_clip = 0;
+        struct pl_render_params params = pl_render_default_params;
+        params.peak_detect_params = &peak;
+        params.color_map_params = &mapping;
+        params.dither_params = NULL;
+        params.frame_mixer = NULL;
+        params.skip_caching_single_frame = true;
+        for (int n = 0; n < 7; n++) {
+            enum pl_source_peak_status status = pl_source_peak_submit(
+                rr, state, 1, ids[n], &sources[n], &peak);
+            REQUIRE(hlg[n] ? status == PL_SOURCE_PEAK_UNSUPPORTED : status >= 0);
+            int acquired = owners[n].acquired;
+            REQUIRE(pl_source_peak_submit(rr, state, 1, ids[n], &sources[n], &peak) == status);
+            REQUIRE(owners[n].acquired == acquired && owners[n].released == acquired);
+        }
+        // Independent raw C measurement defines the history after the boundary.
+        pl_shader_obj measurement = NULL;
+        pl_shader sh = peak_record_shader(dispatch, textures[3], 1);
+        REQUIRE(sh_measure_peak(sh, sources[3].color, &measurement, &peak));
+        REQUIRE(pl_dispatch_compute(dispatch, pl_dispatch_compute_params(
+            .shader = &sh, .width = 32, .height = 32)));
+        struct sh_peak_result raw, cold = {0};
+        REQUIRE(sh_get_peak_measurement(measurement, true, &raw) == SH_PEAK_READY);
+        sh_peak_smooth(&cold, &raw, &peak);
+        pl_shader_obj_destroy(&measurement);
+        const struct pl_frame *visible = &sources[0];
+        uint64_t visible_id = ids[0], signature = 2000;
+        double timestamp = 0;
+        struct pl_frame_mix mix = {
+            .num_frames = 1, .frames = &visible, .signatures = &signature,
+            .timestamps = &timestamp, .vsync_duration = 1,
+        };
+        struct pl_source_peak_context context = {
+            .state = state, .epoch = 1, .ids = &visible_id, .current_id = ids[0],
+        };
+        struct custom_mix_test custom = {
+            .gpu = gpu, .dispatch = dispatch, .count = 1, .timestamps = &timestamp,
+        };
+        struct pl_custom_frame_mixer mixer = {.priv = &custom, .mix = custom_mix_callback};
+        REQUIRE(pl_render_image_mix_source(rr, &mix, &target, &params, &context, NULL));
+        struct pl_hdr_metadata metadata = {0};
+        REQUIRE(pl_source_peak_get_hdr_metadata(state, 1, ids[0], &metadata) == !delayed);
+        // Current is unsupported B, but the only used source is eligible C.
+        context.current_id = ids[1];
+        visible = &sources[3]; visible_id = ids[3]; signature = 2003;
+        REQUIRE(pl_render_image_mix_source(rr, &mix, &target, &params, &context, NULL));
+        REQUIRE(!pl_source_peak_get_hdr_metadata(state, 1, ids[1], &metadata));
+        REQUIRE(!pl_renderer_get_hdr_metadata(rr, &metadata));
+        if (delayed)
+            REQUIRE(!pl_source_peak_get_hdr_metadata(state, 1, ids[3], &metadata));
+        else
+            source_time_expect(state, 1, ids[3], &cold);
+        REQUIRE(pl_render_image_mix_source(rr, &mix, &target, &params, &context, &mixer));
+        // Merely being the clock boundary does not prohibit custom eligible C.
+        visible = &sources[1]; visible_id = ids[1]; signature = 2001;
+        int calls = custom.calls;
+        REQUIRE(!pl_render_image_mix_source(rr, &mix, &target, &params, &context, &mixer));
+        REQUIRE(custom.calls == calls);
+        REQUIRE(!pl_source_peak_get_hdr_metadata(state, 1, ids[1], &metadata));
+        for (int segment = 0; segment < 2; segment++) {
+            // Each oracle starts at this segment, but keeps its own history for
+            // the second source. This distinguishes reset-on-entry from reset
+            // every frame, without changing any production peak parameters.
+            pl_renderer oracle = pl_renderer_create(gpu->log, gpu);
+            REQUIRE(oracle);
+            for (int step = 0; step < 2; step++) {
+                int n = segment ? 5 + step : 1 + step;
+                visible = &sources[n]; visible_id = ids[n]; signature = 2000 + n;
+                context.current_id = ids[n];
+                REQUIRE(pl_render_image_mix_source(rr, &mix, &target, &params, &context, NULL));
+                custom_mix_download(gpu, dst, actual);
+                REQUIRE(!pl_source_peak_get_hdr_metadata(state, 1, ids[n], &metadata));
+                REQUIRE(pl_render_image(oracle, &sources[n], &target, &params));
+                custom_mix_download(gpu, dst, expected);
+                printf("Source HLG boundary delayed=%d segment=%d step=%d\n",
+                       delayed, segment, step);
+                fflush(stdout);
+                custom_mix_compare(actual, expected, 32 * 32 * 4);
+                // Public timed metadata follows the logical current source,
+                // never the legacy detector used to display this HLG segment.
+                struct pl_hdr_metadata observed = {0}, wanted = {0};
+                REQUIRE(!pl_renderer_get_hdr_metadata(rr, &observed));
+                REQUIRE(pl_renderer_get_hdr_metadata(oracle, &wanted));
+                REQUIRE(wanted.avg_pq_y > 0 && wanted.max_pq_y > 0);
+                if (step) {
+                    pl_renderer fresh = pl_renderer_create(gpu->log, gpu);
+                    REQUIRE(fresh);
+                    REQUIRE(pl_render_image(fresh, &sources[n], &target, &params));
+                    float fresh_pixels[32 * 32 * 4];
+                    custom_mix_download(gpu, dst, fresh_pixels);
+                    struct pl_hdr_metadata fresh_metadata = {0};
+                    REQUIRE(pl_renderer_get_hdr_metadata(fresh, &fresh_metadata));
+                    REQUIRE(fresh_metadata.avg_pq_y > 0 && fresh_metadata.max_pq_y > 0);
+                    REQUIRE(fabsf(wanted.avg_pq_y - fresh_metadata.avg_pq_y) > 1e-6f ||
+                            fabsf(wanted.max_pq_y - fresh_metadata.max_pq_y) > 1e-6f);
+                    double difference = 0;
+                    for (int i = 0; i < 32 * 32 * 4; i++)
+                        difference = PL_MAX(difference, fabs(expected[i] - fresh_pixels[i]));
+                    printf("Source HLG history observable delayed=%d segment=%d max=%g\n",
+                           delayed, segment, difference);
+                    fflush(stdout);
+                    REQUIRE(difference > .003);
+                    pl_renderer_destroy(&fresh);
+                }
+            }
+            pl_renderer_destroy(&oracle);
+            if (!segment) {
+                visible = &sources[3]; visible_id = ids[3]; signature = 2003;
+                context.current_id = ids[3];
+                REQUIRE(pl_render_image_mix_source(rr, &mix, &target, &params, &context, NULL));
+                if (delayed)
+                    REQUIRE(!pl_source_peak_get_hdr_metadata(state, 1, ids[3], &metadata));
+                else
+                    source_time_expect(state, 1, ids[3], &cold);
+                visible = &sources[4]; visible_id = ids[4]; signature = 2004;
+                context.current_id = ids[4];
+                REQUIRE(pl_render_image_mix_source(rr, &mix, &target, &params, &context, NULL));
+                if (delayed)
+                    source_time_expect(state, 1, ids[4], &cold);
+            }
+        }
+        // A real acquisition ERROR must never become an unsupported boundary.
+        struct custom_mix_owner failure = {.fail = true};
+        struct pl_frame failed = sources[0];
+        failed.user_data = &failure;
+        REQUIRE(pl_source_peak_submit(rr, state, 1, 90, &failed, &peak) == PL_SOURCE_PEAK_ERROR);
+        visible = &failed; visible_id = context.current_id = 90; signature = 2090;
+        REQUIRE(!pl_render_image_mix_source(rr, &mix, &target, &params, &context, NULL));
+        REQUIRE(failure.acquired == 1 && failure.released == 1);
+        REQUIRE(pl_source_peak_submit(rr, state, 1, 90, &failed, &peak) == PL_SOURCE_PEAK_ERROR);
+        REQUIRE(failure.acquired == 1 && failure.released == 1);
+        pl_renderer_destroy(&rr);
+        pl_source_peak_state_destroy(&state);
+    }
+    pl_dispatch_destroy(&dispatch);
+    for (int n = 0; n < 7; n++)
+        pl_tex_destroy(gpu, &textures[n]);
+    pl_tex_destroy(gpu, &dst);
+    puts("Source-time unsupported boundaries and legacy segment ownership: passed");
+}
+
+static void source_time_field_tests(pl_gpu gpu)
+{
+    enum { SIZE = 16, SOURCES = 4 };
+    pl_fmt fmt = pl_find_fmt(gpu, PL_FMT_UNORM, 4, 8, 8,
+        PL_FMT_CAP_SAMPLEABLE | PL_FMT_CAP_RENDERABLE | PL_FMT_CAP_HOST_READABLE);
+    REQUIRE(fmt);
+    uint8_t woven[SIZE * SIZE * 4];
+    for (int i = 0; i < SIZE * SIZE; i++) {
+        memset(&woven[4 * i], (i / SIZE) % 2 ? 224 : 32, 3);
+        woven[4 * i + 3] = 255;
+    }
+    pl_tex input = pl_tex_create(gpu, pl_tex_params(
+        .w = SIZE, .h = SIZE, .format = fmt, .sampleable = true,
+        .initial_data = woven));
+    pl_tex dst = pl_tex_create(gpu, pl_tex_params(
+        .w = SIZE, .h = SIZE, .format = fmt, .renderable = true,
+        .host_readable = true));
+    REQUIRE(input && dst);
+    struct pl_frame target = custom_mix_frame(dst);
+    const struct pl_render_params params = {
+        .frame_mixer = &pl_filter_mitchell_clamp,
+        .deinterlace_params = pl_deinterlace_params(.algo = PL_DEINTERLACE_BOB),
+    };
+    pl_renderer timed = pl_renderer_create(gpu->log, gpu);
+    pl_renderer ordinary = pl_renderer_create(gpu->log, gpu);
+    pl_queue queue = pl_queue_create(gpu);
+    pl_source_peak_state state = pl_source_peak_state_create(gpu->log, gpu);
+
+    for (enum pl_field first = PL_FIELD_TOP; first <= PL_FIELD_BOTTOM; first++) {
+        pl_queue_reset(queue);
+        REQUIRE(pl_source_peak_state_reset(state, first));
+        struct pl_frame native[SOURCES];
+        uint64_t source_ids[SOURCES];
+        for (int i = 0; i < SOURCES; i++) {
+            source_ids[i] = i + 1;
+            native[i] = custom_mix_frame(input);
+            native[i].user_data = &source_ids[i];
+            REQUIRE(pl_source_peak_submit(timed, state, first, source_ids[i], NULL, NULL) ==
+                    PL_SOURCE_PEAK_READY);
+            pl_queue_push(queue, &(struct pl_source_frame) {
+                .pts = i * .04, .duration = .04, .first_field = first,
+                .frame_data = &native[i], .map = frame_passthrough,
+            });
+        }
+        pl_queue_push(queue, NULL);
+        struct pl_frame_mix mix;
+        REQUIRE(pl_queue_update(queue, &mix, &(struct pl_queue_params) {
+            .pts = .01, .radius = pl_frame_mix_radius(&params),
+            .vsync_duration = 1.0 / 120.0,
+        }) == PL_QUEUE_OK);
+        REQUIRE(mix.num_frames >= 2 && mix.num_frames <= 2 * SOURCES);
+        uint64_t ids[2 * SOURCES];
+        const struct pl_frame *views[2 * SOURCES];
+        int pair = -1;
+        for (int i = 0; i < mix.num_frames; i++) {
+            views[i] = mix.frames[i];
+            ids[i] = *(const uint64_t *) views[i]->user_data;
+            if (i && ids[i] == ids[i - 1]) {
+                REQUIRE(views[i - 1]->field == first && views[i]->field == pl_field_other(first));
+                REQUIRE(mix.signatures[i] != mix.signatures[i - 1]);
+                REQUIRE(mix.timestamps[i] > mix.timestamps[i - 1]);
+                pair = i;
+            }
+        }
+        REQUIRE(pair > 0);
+        struct pl_source_peak_context context = {
+            .state = state, .epoch = first, .ids = ids, .current_id = ids[0],
+        };
+        uint8_t expected[sizeof(woven)], actual[sizeof(woven)];
+        REQUIRE(pl_render_image_mix(ordinary, &mix, &target, &params));
+        REQUIRE(pl_tex_download(gpu, pl_tex_transfer_params(.tex = dst, .ptr = expected)));
+        REQUIRE(pl_render_image_mix_source(timed, &mix, &target, &params, &context, NULL));
+        REQUIRE(pl_tex_download(gpu, pl_tex_transfer_params(.tex = dst, .ptr = actual)));
+        REQUIRE(memcmp(expected, actual, sizeof(actual)) == 0);
+
+        views[pair] = views[pair - 1];
+        mix.frames = views;
+        REQUIRE(!pl_render_image_mix_source(timed, &mix, &target, &params, &context, NULL));
+        pl_queue_reset(queue);
+    }
+    pl_source_peak_state_destroy(&state);
+    pl_queue_destroy(&queue);
+    pl_renderer_destroy(&ordinary);
+    pl_renderer_destroy(&timed);
+    pl_tex_destroy(gpu, &dst);
+    pl_tex_destroy(gpu, &input);
+    puts("Source-time field pairs retain the ordinary renderer output");
+}
+
 void gpu_shader_tests(pl_gpu gpu)
 {
     pl_buffer_tests(gpu);
@@ -2944,6 +5402,12 @@ void gpu_shader_tests(pl_gpu gpu)
 #endif
     pl_scaler_tests(gpu);
     pl_render_tests(gpu);
+    pl_custom_mix_tests(gpu);
+    peak_record_tests(gpu);
+    source_time_tests(gpu);
+    source_time_boundary_tests(gpu);
+    source_time_field_tests(gpu);
+    pl_render_sampling_tests(gpu);
     pl_render_offset_tests(gpu);
     pl_render_bits_tests(gpu);
     pl_render_deband_tests(gpu);
