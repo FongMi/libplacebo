@@ -1802,6 +1802,84 @@ static void pl_render_tests(pl_gpu gpu)
         qparams.pts += qparams.vsync_duration;
     }
 
+    // A progressive successor still supplies the next source to both fields.
+    struct pl_frame progressive = image;
+    progressive.user_data = &progressive;
+    for (enum pl_field first = PL_FIELD_TOP; first <= PL_FIELD_BOTTOM; first++) {
+        for (int has_duration = 0; has_duration < 2; has_duration++) {
+            pl_queue_reset(queue);
+            pl_queue_push(queue, &(struct pl_source_frame) {
+                .first_field = first, .duration = has_duration ? .04 : 0,
+                .frame_data = &image, .map = frame_passthrough,
+            });
+            qparams = (struct pl_queue_params) {.vsync_duration = .02};
+            REQUIRE(pl_queue_update(queue, &mix, &qparams) == PL_QUEUE_MORE);
+            REQUIRE(mix.num_frames > 0 && mix.frames[0]->field == first);
+            REQUIRE(!mix.frames[0]->next);
+            uint64_t provisional_signature = mix.signatures[0];
+
+            pl_queue_push(queue, &(struct pl_source_frame) {
+                .pts = .04, .duration = .04,
+                .frame_data = &progressive, .map = frame_passthrough,
+            });
+            struct pl_source_frame queued;
+            REQUIRE(pl_queue_peek(queue, 0, &queued));
+            REQUIRE(queued.pts == 0 && queued.frame_data == &image);
+            REQUIRE(pl_queue_peek(queue, 1, &queued));
+            REQUIRE(queued.pts == .02 && queued.frame_data == &image);
+            REQUIRE(queued.first_field == first && queued.map == frame_passthrough);
+            REQUIRE(queued.duration == (has_duration ? .04 : 0));
+            REQUIRE(pl_queue_peek(queue, 2, &queued));
+            REQUIRE(queued.pts == .04 && queued.frame_data == &progressive);
+            REQUIRE(fabs(pl_queue_estimate_fps(queue) - 50.0) < 1e-6);
+            pl_queue_push(queue, &(struct pl_source_frame) {
+                .pts = .08, .duration = .04,
+                .frame_data = &progressive, .map = frame_passthrough,
+            });
+
+            REQUIRE(pl_queue_update(queue, &mix, &qparams) == PL_QUEUE_OK);
+            REQUIRE(mix.num_frames > 0 && mix.frames[0]->field == first);
+            REQUIRE(mix.frames[0]->next && mix.frames[0]->next->user_data == &progressive);
+            uint64_t first_signature = mix.signatures[0];
+            REQUIRE(first_signature != provisional_signature);
+
+            qparams.pts = .02;
+            REQUIRE(pl_queue_update(queue, &mix, &qparams) == PL_QUEUE_OK);
+            REQUIRE(mix.num_frames > 0 && mix.frames[0]->field == pl_field_other(first));
+            REQUIRE(mix.timestamps[0] == 0);
+            REQUIRE(mix.frames[0]->first_field == first);
+            REQUIRE(mix.frames[0]->next && mix.frames[0]->next->user_data == &progressive);
+            REQUIRE(mix.signatures[0] != first_signature);
+
+            qparams.pts = .04;
+            REQUIRE(pl_queue_update(queue, &mix, &qparams) == PL_QUEUE_OK);
+            REQUIRE(mix.num_frames > 0 && mix.frames[0]->field == PL_FIELD_NONE);
+            REQUIRE(mix.frames[0]->user_data == &progressive);
+        }
+
+        // Inserting an earlier source updates both already queued field views.
+        pl_queue_reset(queue);
+        pl_queue_push(queue, &(struct pl_source_frame) {
+            .pts = .04, .duration = .04, .first_field = first,
+            .frame_data = &image, .map = frame_passthrough,
+        });
+        pl_queue_push(queue, &(struct pl_source_frame) {
+            .duration = .04, .frame_data = &progressive, .map = frame_passthrough,
+        });
+        pl_queue_push(queue, &(struct pl_source_frame) {
+            .pts = .08, .duration = .04,
+            .frame_data = &progressive, .map = frame_passthrough,
+        });
+        for (int n = 0; n < 2; n++) {
+            qparams = (struct pl_queue_params) {.pts = .04 + .02 * n};
+            REQUIRE(pl_queue_update(queue, &mix, &qparams) == PL_QUEUE_OK);
+            REQUIRE(mix.num_frames > 0);
+            REQUIRE(mix.frames[0]->field == (n ? pl_field_other(first) : first));
+            REQUIRE(mix.frames[0]->prev && mix.frames[0]->prev->user_data == &progressive);
+        }
+    }
+    puts("Interlaced fields retain a progressive successor");
+
     pl_queue_destroy(&queue);
 
 error:
@@ -5804,6 +5882,148 @@ static void source_time_field_tests(pl_gpu gpu)
     puts("Source-time field pairs retain the ordinary renderer output");
 }
 
+static void queue_field_duration_tests(pl_gpu gpu)
+{
+    pl_queue queue = pl_queue_create(gpu);
+    struct pl_frame frames[8] = {0};
+    struct pl_source_frame queued;
+    for (enum pl_field first = PL_FIELD_TOP; first <= PL_FIELD_BOTTOM; first++) {
+        for (int progressive = 0; progressive < 2; progressive++) {
+            pl_queue_reset(queue);
+            // Sparse sources leave an estimate much longer than the next pair.
+            for (int i = 0; i < 8; i++) {
+                frames[i].user_data = &frames[i];
+                pl_queue_push(queue, &(struct pl_source_frame) {
+                    .pts = i < 6 ? i : 5 + (i - 5) * .04,
+                    .first_field = i == 7 && progressive ? PL_FIELD_NONE : first,
+                    .frame_data = &frames[i], .map = frame_passthrough,
+                });
+            }
+            int previous = -1, count = 0;
+            for (; pl_queue_peek(queue, count, &queued); count++) {
+                int index = (struct pl_frame *) queued.frame_data - frames;
+                REQUIRE(index >= previous);
+                previous = index;
+                if (count == 11)
+                    REQUIRE(fabs(queued.pts - 5.02) < 1e-9);
+                if (count == 13)
+                    REQUIRE(fabs(queued.pts - 5.06) < 1e-9);
+            }
+            REQUIRE(count == (progressive ? 15 : 16));
+            double last_pts = 0;
+            if (!progressive) {
+                REQUIRE(pl_queue_peek(queue, 15, &queued));
+                REQUIRE(queued.frame_data == &frames[7] && queued.pts > 5.08);
+                last_pts = queued.pts;
+            }
+            pl_queue_push(queue, NULL);
+            REQUIRE(pl_queue_peek(queue, 14, &queued));
+            REQUIRE(queued.frame_data == &frames[7]);
+            REQUIRE(pl_queue_peek(queue, 15, &queued) == !progressive);
+            if (!progressive) {
+                REQUIRE(queued.frame_data == &frames[7]);
+                REQUIRE(queued.pts == last_pts);
+            }
+            REQUIRE(!pl_queue_peek(queue, 16, &queued));
+            pl_queue_push(queue, NULL);
+            REQUIRE(!pl_queue_peek(queue, 16, &queued));
+        }
+
+        // Retiming retains the primary even after its first field was culled.
+        pl_queue_reset(queue);
+        pl_queue_push(queue, &(struct pl_source_frame) {
+            .duration = .04, .first_field = first,
+            .frame_data = &frames[0], .map = frame_passthrough,
+        });
+        pl_queue_push(queue, &(struct pl_source_frame) {
+            .pts = .04, .first_field = first,
+            .frame_data = &frames[1], .map = frame_passthrough,
+        });
+        struct pl_frame_mix mix;
+        struct pl_queue_params params = {.pts = .06, .vsync_duration = .02};
+        for (int repeat = 0; repeat < 2; repeat++) {
+            REQUIRE(pl_queue_update(queue, &mix, &params) == PL_QUEUE_MORE);
+            REQUIRE(mix.num_frames == 1);
+            REQUIRE(mix.frames[0]->user_data == &frames[1]);
+            REQUIRE(mix.frames[0]->field == pl_field_other(first));
+        }
+        REQUIRE(pl_queue_peek(queue, 0, &queued));
+        REQUIRE(queued.pts == .06 && queued.frame_data == &frames[1]);
+        REQUIRE(!pl_queue_peek(queue, 1, &queued));
+        pl_queue_push(queue, &(struct pl_source_frame) {
+            .pts = .12, .duration = .04, .first_field = first,
+            .frame_data = &frames[2], .map = frame_passthrough,
+        });
+        REQUIRE(pl_queue_peek(queue, 0, &queued));
+        REQUIRE(queued.pts == .06 && queued.frame_data == &frames[1]);
+        params.pts = .07;
+        REQUIRE(pl_queue_update(queue, &mix, &params) != PL_QUEUE_ERR);
+        REQUIRE(mix.num_frames > 0 && mix.frames[0]->user_data == &frames[1]);
+        REQUIRE(mix.frames[0]->next && mix.frames[0]->next->user_data == &frames[2]);
+        params.pts = .15;
+        REQUIRE(pl_queue_update(queue, &mix, &params) == PL_QUEUE_MORE);
+        pl_queue_push(queue, &(struct pl_source_frame) {
+            .pts = .16, .duration = .04, .first_field = first,
+            .frame_data = &frames[3], .map = frame_passthrough,
+        });
+        for (int i = 0; pl_queue_peek(queue, i, &queued); i++)
+            REQUIRE(queued.frame_data != &frames[1]);
+
+        // A late estimate can still move earlier after the primary was culled.
+        pl_queue_reset(queue);
+        pl_queue_push(queue, &(struct pl_source_frame) {
+            .duration = 1, .first_field = first,
+            .frame_data = &frames[0], .map = frame_passthrough,
+        });
+        pl_queue_push(queue, &(struct pl_source_frame) {
+            .pts = 1, .first_field = first,
+            .frame_data = &frames[1], .map = frame_passthrough,
+        });
+        params.pts = 1.5;
+        REQUIRE(pl_queue_update(queue, &mix, &params) == PL_QUEUE_MORE);
+        REQUIRE(pl_queue_peek(queue, 0, &queued));
+        REQUIRE(queued.pts == 1.5 && queued.frame_data == &frames[1]);
+        REQUIRE(!pl_queue_peek(queue, 1, &queued));
+        pl_queue_push(queue, &(struct pl_source_frame) {
+            .pts = 1.6, .duration = .04, .first_field = first,
+            .frame_data = &frames[2], .map = frame_passthrough,
+        });
+        REQUIRE(pl_queue_peek(queue, 0, &queued));
+        REQUIRE(queued.pts == 1.3 && queued.frame_data == &frames[1]);
+        params.pts = 1.6;
+        REQUIRE(pl_queue_update(queue, &mix, &params) != PL_QUEUE_ERR);
+        REQUIRE(mix.num_frames > 0 && mix.frames[0]->user_data == &frames[2]);
+
+        // Explicit duration remains authoritative when another source arrives.
+        pl_queue_reset(queue);
+        pl_queue_push(queue, &(struct pl_source_frame) {
+            .duration = .08, .first_field = first,
+            .frame_data = &frames[0], .map = frame_passthrough,
+        });
+        pl_queue_push(queue, &(struct pl_source_frame) {
+            .pts = .06, .frame_data = &frames[1], .map = frame_passthrough,
+        });
+        REQUIRE(pl_queue_peek(queue, 1, &queued));
+        REQUIRE(queued.pts == .04 && queued.frame_data == &frames[0]);
+
+        for (int explicit_duration = 0; explicit_duration < 2; explicit_duration++) {
+            pl_queue_reset(queue);
+            pl_queue_push(queue, &(struct pl_source_frame) {
+                .duration = explicit_duration ? .04 : 0, .first_field = first,
+                .frame_data = &frames[0], .map = frame_passthrough,
+            });
+            pl_queue_push(queue, NULL);
+            REQUIRE(pl_queue_peek(queue, 0, &queued));
+            REQUIRE(pl_queue_peek(queue, 1, &queued) == !!explicit_duration);
+            if (explicit_duration)
+                REQUIRE(fabs(queued.pts - .02) < 1e-9);
+            REQUIRE(!pl_queue_peek(queue, 2, &queued));
+        }
+    }
+    pl_queue_destroy(&queue);
+    puts("Unknown field durations follow the next source, including EOF");
+}
+
 static void snapshot_rejected(pl_dispatch dp, pl_shader src)
 {
     pl_shader dst = pl_dispatch_begin(dp);
@@ -6110,6 +6330,7 @@ static void shader_snapshot_tests(pl_gpu gpu)
 void gpu_shader_tests(pl_gpu gpu)
 {
     shader_snapshot_tests(gpu);
+    queue_field_duration_tests(gpu);
     pl_buffer_tests(gpu);
     pl_texture_tests(gpu);
     pl_planar_tests(gpu);

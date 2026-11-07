@@ -276,6 +276,38 @@ static inline void update_estimate(struct pool *pool, double cur)
         pool->estimate = pool->sum / pool->num;
 }
 
+static void retime_second_field(pl_queue p, double pts)
+{
+    struct entry *prev = NULL;
+    for (int i = 0; i < p->queue.num; i++) {
+        struct entry *entry = PL_DEF(p->queue.elem[i]->primary, p->queue.elem[i]);
+        if (entry->pts < pts && (!prev || entry->pts > prev->pts))
+            prev = entry;
+    }
+    if (!prev || !prev->field || prev->src.duration)
+        return;
+
+    for (int i = 0; i < p->queue.num; i++) {
+        struct entry *entry = p->queue.elem[i];
+        if (entry->primary != prev)
+            continue;
+        // Replace the provisional estimate with the next source's actual PTS.
+        // The primary may already have been culled from the queue.
+        double midpoint = (prev->pts + pts) / 2;
+        // Once the first field was culled, moving the queue head into the
+        // future would leave a gap in the interval already being presented.
+        if (i == 0 && midpoint > entry->pts)
+            return;
+        entry->pts = midpoint;
+        PL_ARRAY_REMOVE_AT(p->queue, i);
+        int pos = p->queue.num;
+        while (pos > 0 && p->queue.elem[pos - 1]->pts > entry->pts)
+            pos--;
+        PL_ARRAY_INSERT_AT(p, p->queue, pos, entry);
+        return;
+    }
+}
+
 static void queue_push(pl_queue p, const struct pl_source_frame *src)
 {
     if (!src && (p->status == PL_QUEUE_EOF || p->status == PL_QUEUE_ERR))
@@ -303,13 +335,15 @@ static void queue_push(pl_queue p, const struct pl_source_frame *src)
         return;
     }
 
+    retime_second_field(p, src->pts);
+
     // Update FPS estimates if possible/reasonable
     default_estimate(&p->fps, src->first_field ? src->duration / 2 : src->duration);
     if (p->queue.num) {
         struct entry *last = p->queue.elem[p->queue.num - 1];
         double last_pts = last->pts;
         double delta = src->pts - last_pts;
-        if (src->first_field != PL_FIELD_NONE && last->defer_second_field)
+        if (last->defer_second_field)
             delta /= 2;
         if (delta <= 0.0f) {
             PL_DEBUG(p, "Non monotonically increasing PTS %f -> %f", last_pts, src->pts);
@@ -337,98 +371,97 @@ static void queue_push(pl_queue p, const struct pl_source_frame *src)
     p->total_fields += interlaced ? 2 : 1;
 
     // Insert new entry into the correct spot in the queue, sorted by PTS
-    for (int i = p->queue.num;; i--) {
-        if (i == 0 || p->queue.elem[i - 1]->pts <= entry->pts) {
-            if (!interlaced) {
-                PL_ARRAY_INSERT_AT(p, p->queue, i, entry);
-                break;
+    int i = p->queue.num;
+    while (i > 0 && p->queue.elem[i - 1]->pts > entry->pts)
+        i--;
+    struct entry *prev = i > 0 ? p->queue.elem[i - 1] : NULL;
+    struct entry *next = i < p->queue.num ? p->queue.elem[i] : NULL;
+
+    // The next source PTS completes a deferred field, regardless of its scan type.
+    if (prev && prev->defer_second_field) {
+        struct entry *prev2 = pl_zalloc_ptr(NULL, prev2);
+        pl_rc_init(&prev2->rc);
+        prev2->pts = (prev->pts + entry->pts) / 2;
+        prev2->field = pl_field_other(prev->field);
+        prev2->primary = entry_ref(prev);
+        if (prev->prev)
+            prev2->prev = entry_ref(prev->prev);
+        prev2->signature = p->signature++;
+        PL_ARRAY_INSERT_AT(p, p->queue, i, prev2);
+        PL_TRACE(p, "Added deferred second field id %"PRIu64" with "
+                 " PTS %f for previous frame with PTS %f",
+                 prev2->signature, prev2->pts, prev->pts);
+
+        prev->defer_second_field = false;
+        prev = prev2;
+        i++;
+    }
+
+    struct entry *entry2 = NULL;
+    if (interlaced) {
+        entry->field = src->first_field;
+        if (next || src->duration || p->fps.estimate) {
+            entry2 = pl_zalloc_ptr(NULL, entry2);
+            pl_rc_init(&entry2->rc);
+            if (next) {
+                entry2->pts = (entry->pts + next->pts) / 2;
             } else {
-                struct entry *prev = i > 0 ? p->queue.elem[i - 1] : NULL;
-                struct entry *next = i < p->queue.num ? p->queue.elem[i] : NULL;
-                if (prev && prev->defer_second_field) {
-                    struct entry *prev2 = pl_zalloc_ptr(NULL, prev2);
-                    pl_rc_init(&prev2->rc);
-                    prev2->pts = (prev->pts + entry->pts) / 2;
-                    prev2->field = pl_field_other(prev->field);
-                    prev2->primary = entry_ref(prev);
-                    prev2->signature = p->signature++;
-                    PL_ARRAY_INSERT_AT(p, p->queue, i, prev2);
-                    PL_TRACE(p, "Added deferred second field id %"PRIu64" with "
-                             " PTS %f for previous frame with PTS %f",
-                             prev2->signature, prev2->pts, prev->pts);
+                double offset = src->duration ? src->duration / 2 : p->fps.estimate;
+                entry2->pts = entry->pts + offset;
+            }
+            entry2->field = pl_field_other(entry->field);
+            entry2->primary = entry_ref(entry);
+            entry2->signature = p->signature++;
+            PL_TRACE(p, "Added second field id %"PRIu64" with PTS %f",
+                     entry2->signature, entry2->pts);
+        } else {
+            PL_DEBUG(p, "Frame with PTS %f specified as interlaced, but "
+                     "no FPS information known yet! Deferring insertion "
+                     "of second field.", src->pts);
+            entry->defer_second_field = true;
+        }
+    }
 
-                    prev->defer_second_field = false;
-                    prev = prev2;
-                    i++;
-                }
-
-                struct entry *entry2 = pl_zalloc_ptr(NULL, entry2);
-                pl_rc_init(&entry2->rc);
-                entry->field = src->first_field;
-                if (next) {
-                    entry2->pts = (entry->pts + next->pts) / 2;
-                } else if (src->duration) {
-                    entry2->pts = entry->pts + src->duration / 2;
-                } else if (p->fps.estimate) {
-                    entry2->pts = entry->pts + p->fps.estimate;
-                } else {
-                    PL_DEBUG(p, "Frame with PTS %f specified as interlaced, but "
-                             "no FPS information known yet! Deferring insertion "
-                             "of second field.", src->pts);
-                    entry->defer_second_field = true;
-                    PL_ARRAY_INSERT_AT(p, p->queue, i, entry);
-                    pl_free(entry2);
-                    break;
-                }
-
-                entry2->field = pl_field_other(entry->field);
-                entry2->primary = entry_ref(entry);
-                entry2->signature = p->signature++;
-
-                PL_TRACE(p, "Added second field id %"PRIu64" with PTS %f",
-                         entry2->signature, entry2->pts);
-
-                // Link previous/next frames
-                if (prev) {
-                    entry->prev = entry_ref(PL_DEF(prev->primary, prev));
-                    entry2->prev = entry_ref(PL_DEF(prev->primary, prev));
-                    // Retroactively re-link the previous frames that should
-                    // be referencing this frame
-                    for (int j = i - 1; j >= 0; --j) {
-                        struct entry *e = p->queue.elem[j];
-                        if (e != prev && e != prev->primary)
-                            break;
-                        entry_deref(p, &e->next, true);
-                        e->next = entry_ref(entry);
-                        if (e->dirty) { // reset signature to signal change
-                            e->signature = p->signature++;
-                            e->dirty = false;
-                        }
-                    }
-                }
-
-                if (next) {
-                    entry->next = entry_ref(PL_DEF(next->primary, next));
-                    entry2->next = entry_ref(PL_DEF(next->primary, next));
-                    for (int j = i; j < p->queue.num; j++) {
-                        struct entry *e = p->queue.elem[j];
-                        if (e != next && e != next->primary)
-                            break;
-                        entry_deref(p, &e->prev, true);
-                        e->prev = entry_ref(entry);
-                        if (e->dirty) {
-                            e->signature = p->signature++;
-                            e->dirty = false;
-                        }
-                    }
-                }
-
-                PL_ARRAY_INSERT_AT(p, p->queue, i, entry);
-                PL_ARRAY_INSERT_AT(p, p->queue, i+1, entry2);
+    // Both fields reference their adjacent source frames, including progressive ones.
+    if (prev && (interlaced || prev->field)) {
+        if (interlaced)
+            entry->prev = entry_ref(PL_DEF(prev->primary, prev));
+        if (entry2)
+            entry2->prev = entry_ref(entry->prev);
+        for (int j = i - 1; j >= 0; --j) {
+            struct entry *e = p->queue.elem[j];
+            if (e != prev && e != prev->primary)
                 break;
+            entry_deref(p, &e->next, true);
+            e->next = entry_ref(entry);
+            if (e->dirty) { // reset signature to signal change
+                e->signature = p->signature++;
+                e->dirty = false;
             }
         }
     }
+
+    if (next && (interlaced || next->field)) {
+        if (interlaced)
+            entry->next = entry_ref(PL_DEF(next->primary, next));
+        if (entry2)
+            entry2->next = entry_ref(entry->next);
+        for (int j = i; j < p->queue.num; j++) {
+            struct entry *e = p->queue.elem[j];
+            if (e != next && e->primary != next)
+                break;
+            entry_deref(p, &e->prev, true);
+            e->prev = entry_ref(entry);
+            if (e->dirty) {
+                e->signature = p->signature++;
+                e->dirty = false;
+            }
+        }
+    }
+
+    PL_ARRAY_INSERT_AT(p, p->queue, i, entry);
+    if (entry2)
+        PL_ARRAY_INSERT_AT(p, p->queue, i+1, entry2);
 
     if (p->status == PL_QUEUE_MORE)
         p->status = PL_QUEUE_OK;
@@ -1130,8 +1163,11 @@ bool pl_queue_peek(pl_queue p, int idx, struct pl_source_frame *out)
 {
     pl_mutex_lock(&p->lock_weak);
     bool ok = idx >= 0 && idx < p->queue.num;
-    if (ok)
-        *out = p->queue.elem[idx]->src;
+    if (ok) {
+        const struct entry *entry = p->queue.elem[idx];
+        *out = PL_DEF(entry->primary, entry)->src;
+        out->pts = entry->pts;
+    }
     pl_mutex_unlock(&p->lock_weak);
     return ok;
 }
