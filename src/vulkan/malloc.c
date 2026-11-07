@@ -1005,7 +1005,7 @@ error:
 
 size_t vk_malloc_avail(struct vk_malloc *ma, VkMemoryPropertyFlags flags)
 {
-    size_t avail = 0;
+    VkDeviceSize avail = 0;
     for (int i = 0; i < ma->props.memoryTypeCount; i++) {
         const VkMemoryType *mtype = &ma->props.memoryTypes[i];
         if ((mtype->propertyFlags & flags) != flags)
@@ -1013,7 +1013,8 @@ size_t vk_malloc_avail(struct vk_malloc *ma, VkMemoryPropertyFlags flags)
         avail = PL_MAX(avail, ma->props.memoryHeaps[mtype->heapIndex].size);
     }
 
-    return avail;
+    // Device heaps can exceed the host address space on 32-bit systems.
+    return (size_t) PL_MIN(avail, SIZE_MAX);
 }
 
 bool vk_malloc_slice(struct vk_malloc *ma, struct vk_memslice *out,
