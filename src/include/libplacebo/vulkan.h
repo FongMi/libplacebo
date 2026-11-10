@@ -409,6 +409,28 @@ PL_API pl_swapchain pl_vulkan_create_swapchain(pl_vulkan vk,
 // who have `params->allow_suboptimal` enabled.
 PL_API bool pl_vulkan_swapchain_suboptimal(pl_swapchain sw);
 
+#define PL_HAVE_VULKAN_PRESENTATION_FEEDBACK 1
+
+struct pl_vulkan_presentation_feedback {
+    uint64_t generation;
+    uint64_t latest_submit_id;
+    uint64_t latest_submit_begin_ns;
+    uint64_t matched_submit_id;
+    uint64_t matched_submit_begin_ns;
+    uint64_t actual_present_ns;
+};
+
+// Poll available presentation feedback without waiting for presentation. Only
+// Vulkan swapchains are supported. Call outside the start_frame/submit_frame
+// lock pair. Times use CLOCK_MONOTONIC on Linux/Android, not pl_clock_now().
+// Returns false and zeroes out when unsupported or no usable matched timing is
+// available. The generation changes on
+// recreation; IDs identify submissions, not display refreshes. Missing timing
+// does not imply a dropped frame. The latest matched observation is historical,
+// and may be reused across calls; callers own any presentation-time prediction.
+PL_API bool pl_vulkan_get_presentation_feedback(pl_swapchain sw,
+                                struct pl_vulkan_presentation_feedback *out);
+
 // Vulkan interop API, for sharing a single VkDevice (and associated vulkan
 // resources) directly with the API user. The use of this API is a bit sketchy
 // and requires careful communication of Vulkan API state.

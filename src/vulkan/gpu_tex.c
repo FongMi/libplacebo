@@ -1703,7 +1703,15 @@ VkImage pl_vulkan_unwrap(pl_gpu gpu, pl_tex tex, VkFormat *out_format,
     return tex_vk->img;
 }
 
-bool pl_vulkan_hold_ex(pl_gpu gpu, const struct pl_vulkan_hold_params *params)
+static void tex_hold_complete(pl_rc_t *pending, void *unused)
+{
+    (void) pl_rc_deref(pending);
+}
+
+VK_CB_FUNC_DEF(tex_hold_complete);
+
+bool vk_tex_hold(pl_gpu gpu, const struct pl_vulkan_hold_params *params,
+                 pl_rc_t *pending, int *queue_index)
 {
     struct pl_tex_vk *tex_vk = PL_PRIV(params->tex);
     pl_assert(params->semaphore.sem);
@@ -1749,6 +1757,12 @@ bool pl_vulkan_hold_ex(pl_gpu gpu, const struct pl_vulkan_hold_params *params)
     }
 
     vk_cmd_sig(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, params->semaphore);
+    if (pending) {
+        pl_rc_ref(pending);
+        vk_cmd_callback(cmd, VK_CB_FUNC(tex_hold_complete), pending, NULL);
+    }
+    if (queue_index)
+        *queue_index = cmd->qindex;
     bool ok = CMD_SUBMIT(&cmd);
 
     if (!tex_vk->num_planes) {
@@ -1766,6 +1780,11 @@ bool pl_vulkan_hold_ex(pl_gpu gpu, const struct pl_vulkan_hold_params *params)
         *params->out_layout = may_invalidate ? VK_IMAGE_LAYOUT_UNDEFINED : layout;
 
     return ok;
+}
+
+bool pl_vulkan_hold_ex(pl_gpu gpu, const struct pl_vulkan_hold_params *params)
+{
+    return vk_tex_hold(gpu, params, NULL, NULL);
 }
 
 void pl_vulkan_release_ex(pl_gpu gpu, const struct pl_vulkan_release_params *params)
