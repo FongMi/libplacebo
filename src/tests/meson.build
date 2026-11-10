@@ -9,7 +9,7 @@ foreach t : tests
   if t == 'opengl_surfaceless.c'
     deps += glad_dep
   endif
-  if t == 'vulkan.c' or t == 'vulkan_geometry.c'
+  if t in ['vulkan.c', 'vulkan_geometry.c', 'vulkan_present.c']
     deps += vulkan_headers
   endif
   sources = []

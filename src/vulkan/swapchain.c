@@ -22,10 +22,16 @@
 #include "gpu.h"
 #include "swapchain.h"
 #include "swapchain_geometry.h"
+#include "swapchain_present.h"
+
+#if defined(__linux__)
+#include <time.h>
+#endif
 #include "pl_thread.h"
 
 struct vk_swapchain {
     VkSwapchainKHR swapchain;
+    struct vk_present_history present;
     pl_rotation rotation;
     // state of the images:
     PL_ARRAY(VkImage) vkimages;     // VkImages waiting to be wrapped
@@ -57,12 +63,49 @@ struct priv {
     bool suboptimal;                // true once VK_SUBOPTIMAL_KHR is returned
     bool needs_recreate;            // swapchain needs to be recreated
     bool has_swapchain_maintenance1;
+    uint64_t generation;
     struct pl_color_repr color_repr;
     struct pl_color_space color_space;
     struct pl_hdr_metadata hdr_metadata;
 };
 
 static const struct pl_sw_fns vulkan_swapchain;
+
+static uint64_t present_time(pl_swapchain sw)
+{
+#if defined(__linux__)
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0)
+        return (uint64_t) ts.tv_sec * 1000000000 + ts.tv_nsec;
+    PL_ERR(sw, "Failed reading presentation CLOCK_MONOTONIC");
+#endif
+    return 0;
+}
+
+bool pl_vulkan_get_presentation_feedback(pl_swapchain sw,
+                                struct pl_vulkan_presentation_feedback *out)
+{
+    struct priv *p = PL_PRIV(sw);
+    *out = (struct pl_vulkan_presentation_feedback) {0};
+    if (p->impl.submit_frame != vulkan_swapchain.submit_frame)
+        return false;
+
+    pl_mutex_lock(&p->lock);
+    struct vk_swapchain *current = p->current;
+    bool ok = false;
+    if (!current || !p->vk->GetPastPresentationTimingGOOGLE || !present_time(sw))
+        goto done;
+
+    VkResult res;
+    ok = vk_present_poll(&current->present, p->vk->dev, current->swapchain,
+                        p->vk->GetPastPresentationTimingGOOGLE, out, &res);
+    if (res != VK_SUCCESS && res != VK_INCOMPLETE &&
+        res != VK_ERROR_OUT_OF_DATE_KHR)
+        PL_ERR(sw, "Failed querying presentation timing: %s", vk_res_str(res));
+done:
+    pl_mutex_unlock(&p->lock);
+    return ok;
+}
 
 
 static bool map_color_space(VkColorSpaceKHR space, struct pl_color_space *out)
@@ -775,6 +818,7 @@ static bool vk_sw_recreate(pl_swapchain sw, int w, int h)
     current->last_imgidx = -1;
     VkResult res = vk->CreateSwapchainKHR(vk->dev, &sinfo, PL_VK_ALLOC, &current->swapchain);
     PL_VK_ASSERT(res, "vk->CreateSwapchainKHR(...)");
+    current->present.feedback.generation = ++p->generation;
 
     // Get the new swapchain images
     VK(vk->GetSwapchainImagesKHR(vk->dev, current->swapchain, &num_images, NULL));
@@ -933,13 +977,6 @@ error:
     return false;
 }
 
-static void present_cb(struct priv *p, void *arg)
-{
-    (void) pl_rc_deref(&p->frames_in_flight);
-}
-
-VK_CB_FUNC_DEF(present_cb);
-
 static bool vk_sw_submit_frame(pl_swapchain sw)
 {
     pl_gpu gpu = sw->gpu;
@@ -948,33 +985,21 @@ static bool vk_sw_submit_frame(pl_swapchain sw)
     struct vk_swapchain *current = p->current;
     pl_assert(current);
     pl_assert(current->last_imgidx >= 0);
+    current->present.feedback.latest_submit_id = 0;
     uint32_t idx = current->last_imgidx;
     VkSemaphore sem_out = current->sems_out.elem[idx];
     current->last_imgidx = -1;
 
-    bool held = pl_vulkan_hold_ex(gpu, pl_vulkan_hold_params(
+    int qidx;
+    bool held = vk_tex_hold(gpu, pl_vulkan_hold_params(
         .tex        = current->images.elem[idx],
         .layout     = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
         .qf         = VK_QUEUE_FAMILY_IGNORED,
         .semaphore  = { sem_out },
-    ));
+    ), &p->frames_in_flight, &qidx);
 
     if (!held) {
         PL_ERR(gpu, "Failed holding swapchain image for presentation");
-        pl_mutex_unlock(&p->lock);
-        return false;
-    }
-
-    struct vk_cmd *cmd = CMD_BEGIN(GRAPHICS);
-    if (!cmd) {
-        pl_mutex_unlock(&p->lock);
-        return false;
-    }
-
-    pl_rc_ref(&p->frames_in_flight);
-    vk_cmd_callback(cmd, VK_CB_FUNC(present_cb), p, NULL);
-    int qidx = cmd->qindex;
-    if (!CMD_SUBMIT(&cmd)) {
         pl_mutex_unlock(&p->lock);
         return false;
     }
@@ -1006,9 +1031,24 @@ static bool vk_sw_submit_frame(pl_swapchain sw)
         pinfo.pNext = &fenceInfo;
     }
 
+    struct vk_present_history *history = &current->present;
+    VkPresentTimeGOOGLE timing = {0};
+    VkPresentTimesInfoGOOGLE times = {
+        .sType = VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE,
+        .swapchainCount = 1,
+        .pTimes = &timing,
+    };
+    if (vk->GetPastPresentationTimingGOOGLE && present_time(sw) &&
+        history->next_id < UINT32_MAX) {
+        timing.presentID = ++history->next_id;
+        vk_link_struct(&pinfo, &times);
+    }
+
     PL_TRACE(vk, "vkQueuePresentKHR waits on 0x%"PRIx64, (uint64_t) sem_out);
     vk->lock_queue(vk->queue_ctx, pool->qf, qidx);
+    uint64_t begin = timing.presentID ? present_time(sw) : 0;
     VkResult res = vk->QueuePresentKHR(queue, &pinfo);
+    vk_present_submit(history, timing.presentID, begin, res);
     vk->unlock_queue(vk->queue_ctx, pool->qf, qidx);
     pl_mutex_unlock(&p->lock);
 

@@ -74,6 +74,37 @@ static void vulkan_interop_tests(pl_vulkan pl_vk,
     }
 }
 
+static void vulkan_texture_hold_test(pl_vulkan vk)
+{
+    pl_gpu gpu = vk->gpu;
+    pl_tex tex = pl_tex_create(gpu, pl_tex_params(
+        .w = 16, .h = 16, .format = pl_find_named_fmt(gpu, "rgba8"),
+        .blit_dst = true,
+    ));
+    REQUIRE(tex);
+    VkSemaphore sem = pl_vulkan_sem_create(gpu, pl_vulkan_sem_params(
+        .type = VK_SEMAPHORE_TYPE_TIMELINE,
+    ));
+    REQUIRE(sem);
+    const struct pl_vulkan_hold_params hold = {
+        .tex = tex,
+        .layout = VK_IMAGE_LAYOUT_GENERAL,
+        .qf = VK_QUEUE_FAMILY_IGNORED,
+        .semaphore = {sem, 1},
+    };
+    pl_rc_t pending;
+    atomic_init(&pending, 0);
+    int queue_index;
+    pl_tex_clear(gpu, tex, (float[4]){0});
+    REQUIRE(vk_tex_hold(gpu, &hold, &pending, &queue_index));
+    REQUIRE(queue_index >= 0 && queue_index < vk->queue_graphics.count);
+    REQUIRE(pl_rc_count(&pending) == 1);
+    pl_gpu_finish(gpu);
+    REQUIRE(pl_rc_count(&pending) == 0);
+    pl_vulkan_sem_destroy(gpu, &sem);
+    pl_tex_destroy(gpu, &tex);
+}
+
 static void vulkan_swapchain_tests(pl_vulkan vk, VkSurfaceKHR surf)
 {
     if (!surf)
@@ -222,6 +253,8 @@ int main()
         ));
         REQUIRE(vk2);
         pl_vulkan_destroy(&vk2);
+
+        vulkan_texture_hold_test(vk);
 
         // Run these tests last because they disable some validation layers
 #ifdef PL_HAVE_UNIX

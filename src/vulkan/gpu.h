@@ -146,6 +146,9 @@ void vk_tex_blit(pl_gpu, const struct pl_tex_blit_params *);
 bool vk_tex_upload(pl_gpu, const struct pl_tex_transfer_params *);
 bool vk_tex_download(pl_gpu, const struct pl_tex_transfer_params *);
 bool vk_tex_poll(pl_gpu, pl_tex, uint64_t timeout);
+// If supplied, track this submission in pending until its command retires.
+bool vk_tex_hold(pl_gpu, const struct pl_vulkan_hold_params *,
+                 pl_rc_t *pending, int *queue_index);
 void vk_tex_barrier(pl_gpu, struct vk_cmd *, pl_tex, VkPipelineStageFlags2,
                     VkAccessFlags2, VkImageLayout, uint32_t qf);
 
