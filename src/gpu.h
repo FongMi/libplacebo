@@ -74,6 +74,7 @@ struct pl_gpu_fns {
     GPU_PFN(gpu_flush); // optional
     GPU_PFN(gpu_finish);
     GPU_PFN(gpu_is_failed); // optional
+    __typeof__(pl_pass_run) *pass_run_deferred; // optional
 };
 #undef GPU_PFN
 
@@ -164,6 +165,8 @@ struct pl_buf_copy_swap_params {
 
 bool pl_buf_copy_swap(pl_gpu gpu, const struct pl_buf_copy_swap_params *params);
 
+void pl_pass_run_ex(pl_gpu gpu, const struct pl_pass_run_params *params,
+                    bool defer_submit);
 void pl_pass_run_vbo(pl_gpu gpu, const struct pl_pass_run_params *params);
 
 // Make a deep-copy of the pass params. Note: cached_program etc. are not

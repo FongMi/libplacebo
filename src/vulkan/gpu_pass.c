@@ -130,19 +130,20 @@ static inline void destroy_pipeline(struct vk_ctx *vk, void *pipeline)
 
 VK_CB_FUNC_DEF(destroy_pipeline);
 
-static VkResult vk_recreate_pipelines(struct vk_ctx *vk, pl_pass pass,
+static VkResult vk_recreate_pipelines(pl_gpu gpu, pl_pass pass,
                                       bool derivable, VkPipeline base,
                                       VkPipeline *out_pipe)
 {
+    struct pl_vk *p = PL_PRIV(gpu);
+    struct vk_ctx *vk = p->vk;
     struct pl_pass_vk *pass_vk = PL_PRIV(pass);
     const struct pl_pass_params *params = &pass->params;
 
     // The old pipeline might still be in use, so we have to destroy it
     // asynchronously with a device idle callback
     if (*out_pipe) {
-        // We don't need to use `vk_gpu_idle_callback` because the only command
-        // that can access a VkPipeline, `vk_pass_run`, always flushes `p->cmd`.
-        vk_dev_callback(vk, VK_CB_FUNC(destroy_pipeline), vk, vk_wrap_handle(*out_pipe));
+        vk_gpu_idle_callback(gpu, VK_CB_FUNC(destroy_pipeline), vk,
+                             vk_wrap_handle(*out_pipe));
         *out_pipe = VK_NULL_HANDLE;
     }
 
@@ -610,7 +611,7 @@ no_descriptors: ;
 
     // Create the graphics/compute pipeline
     VkPipeline *pipe = has_spec ? &pass_vk->base : &pass_vk->pipe;
-    VK(vk_recreate_pipelines(vk, pass, has_spec, VK_NULL_HANDLE, pipe));
+    VK(vk_recreate_pipelines(gpu, pass, has_spec, VK_NULL_HANDLE, pipe));
     pl_log_cpu_time(gpu->log, after_compilation, pl_clock_now(), "creating pipeline");
 
     // Update pipeline cache
@@ -823,7 +824,8 @@ static bool need_respec(pl_pass pass, const struct pl_pass_run_params *params)
     return false;
 }
 
-void vk_pass_run(pl_gpu gpu, const struct pl_pass_run_params *params)
+static void pass_run(pl_gpu gpu, const struct pl_pass_run_params *params,
+                     bool defer_submit)
 {
     struct pl_vk *p = PL_PRIV(gpu);
     struct vk_ctx *vk = p->vk;
@@ -836,12 +838,14 @@ void vk_pass_run(pl_gpu gpu, const struct pl_pass_run_params *params)
     // Check if we need to re-specialize this pipeline
     if (need_respec(pass, params)) {
         pl_clock_t start = pl_clock_now();
-        VK(vk_recreate_pipelines(vk, pass, false, pass_vk->base, &pass_vk->pipe));
+        VK(vk_recreate_pipelines(gpu, pass, false, pass_vk->base, &pass_vk->pipe));
         pl_log_cpu_time(gpu->log, start, pl_clock_now(), "re-specializing shader");
     }
 
     if (!pass_vk->use_pushd) {
-        // Wait for a free descriptor set
+        // A pending command can own the descriptor sets we are waiting for.
+        if (!pass_vk->dmask && !CMD_SUBMIT(NULL))
+            goto error;
         while (!pass_vk->dmask) {
             PL_TRACE(gpu, "No free descriptor sets! ...blocking (slow path)");
             vk_poll_commands(vk, 10000000); // 10 ms
@@ -1005,9 +1009,18 @@ void vk_pass_run(pl_gpu gpu, const struct pl_pass_run_params *params)
     for (int i = 0; i < pass->params.num_descriptors; i++)
         vk_release_descriptor(gpu, cmd, pass, params->desc_bindings[i], i);
 
-    // submit this command buffer for better intra-frame granularity
-    CMD_SUBMIT(&cmd);
+    _end_cmd(gpu, &cmd, !defer_submit);
 
 error:
     return;
+}
+
+void vk_pass_run(pl_gpu gpu, const struct pl_pass_run_params *params)
+{
+    pass_run(gpu, params, false);
+}
+
+void vk_pass_run_deferred(pl_gpu gpu, const struct pl_pass_run_params *params)
+{
+    pass_run(gpu, params, true);
 }
