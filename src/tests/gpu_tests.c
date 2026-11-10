@@ -8,6 +8,7 @@
 #include <libplacebo/utils/upload.h>
 
 #include "dispatch.h"
+#include "gpu.h"
 
 //#define PRINT_OUTPUT
 
@@ -6049,6 +6050,255 @@ static void queue_field_duration_tests(pl_gpu gpu)
     puts("Unknown field durations follow the next source, including EOF");
 }
 
+static struct {
+    struct pl_gpu_fns original;
+    int creates, runs, writes, queries;
+    const void *forbidden_object;
+} prepared_spy;
+
+static pl_pass prepared_create(pl_gpu gpu, const struct pl_pass_params *params)
+{
+    prepared_spy.creates++;
+    return prepared_spy.original.pass_create(gpu, params);
+}
+
+static void prepared_run(pl_gpu gpu, const struct pl_pass_run_params *params)
+{
+    prepared_spy.runs++;
+    for (int i = 0; i < params->pass->params.num_descriptors; i++) {
+        if (params->desc_bindings[i].object == prepared_spy.forbidden_object)
+            return; // Synthetic schema probes must never reach the backend.
+    }
+    prepared_spy.original.pass_run(gpu, params);
+}
+
+static void prepared_write(pl_gpu gpu, pl_buf buf, size_t offset,
+                           const void *data, size_t size)
+{
+    prepared_spy.writes++;
+    prepared_spy.original.buf_write(gpu, buf, offset, data, size);
+}
+
+static uint64_t prepared_query(pl_gpu gpu, pl_timer timer)
+{
+    prepared_spy.queries++;
+    return prepared_spy.original.timer_query(gpu, timer);
+}
+
+void pl_prepared_tests(pl_gpu gpu)
+{
+    if (!gpu->glsl.compute || !gpu->limits.max_constants)
+        return;
+    pl_fmt fmt = pl_find_fmt(gpu, PL_FMT_FLOAT, 4, 32, 32,
+                           PL_FMT_CAP_STORABLE | PL_FMT_CAP_RENDERABLE | PL_FMT_CAP_SAMPLEABLE);
+    if (!fmt)
+        return;
+    puts("Prepared dispatch: real pixels, shared passes, GC pins, validation and no prepare work");
+    float pixels[8 * 8 * 4] = {0};
+    pl_tex tex = pl_tex_create(gpu, pl_tex_params(
+        .w = 8, .h = 8, .format = fmt, .sampleable = true,
+        .initial_data = pixels));
+    pl_tex out = pl_tex_create(gpu, pl_tex_params(
+        .w = 8, .h = 8, .format = fmt, .storable = true,
+        .renderable = true, .host_readable = true));
+    REQUIRE(tex && out);
+    struct pl_gpu_fns *fns = PL_PRIV(gpu);
+    memset(&prepared_spy, 0, sizeof(prepared_spy));
+    prepared_spy.original = *fns;
+    fns->pass_create = prepared_create;
+    fns->pass_run = prepared_run;
+    fns->buf_write = prepared_write;
+    fns->timer_query = prepared_query;
+    pl_dispatch dp = pl_dispatch_create(gpu->log, gpu);
+    float value = 0.25f, constant = 0.5f;
+    float matrices[16 * 16] = {0};
+    struct pl_shader_var vars[] = {
+        {.var = pl_var_float("value"), .data = &value, .dynamic = true},
+        {.var = {.name = "matrices", .type = PL_VAR_FLOAT, .dim_v = 4,
+                 .dim_m = 4, .dim_a = 16}, .data = matrices},
+    };
+    struct pl_shader_desc desc = {
+        .desc = {.name = "input_tex", .type = PL_DESC_SAMPLED_TEX},
+        .binding = {.object = tex},
+    };
+    struct pl_shader_const con = {.name = "coeff", .type = PL_VAR_FLOAT, .data = &constant};
+    struct pl_custom_shader custom = {
+        .body = "color = texelFetch(input_tex, ivec2(gl_GlobalInvocationID.xy), 0)"
+                " + vec4(value + coeff + matrices[0][0][0]);",
+        .input = PL_SHADER_SIG_NONE, .output = PL_SHADER_SIG_COLOR,
+        .compute = true, .compute_group_size = {8, 8},
+        .variables = vars, .num_variables = 2,
+        .descriptors = &desc, .num_descriptors = 1,
+        .constants = &con, .num_constants = 1,
+    };
+    pl_dispatch_prepared handles[2];
+    for (int i = 0; i < 2; i++) {
+        constant = i ? 0.125f : 0.5f;
+        pl_dispatch_reset_frame(dp);
+        pl_shader sh = pl_dispatch_begin(dp);
+        REQUIRE(pl_shader_custom(sh, &custom));
+        handles[i] = pl_dispatch_prepare(dp, pl_dispatch_params(.shader = &sh, .target = out));
+        REQUIRE(handles[i] && !sh);
+    }
+    REQUIRE_CMP(prepared_spy.creates, ==, 1, "d");
+    REQUIRE_CMP(prepared_spy.runs, ==, 0, "d");
+    REQUIRE_CMP(prepared_spy.writes, ==, 0, "d");
+    REQUIRE_CMP(prepared_spy.queries, ==, 0, "d");
+    struct pl_dispatch_prepared_params run = {
+        .descriptors = &desc.binding, .num_descriptors = 1,
+        .variables = vars, .num_variables = 2, .target = out,
+    };
+    for (int n = 0; n < 4; n++) {
+        int i = n % 2;
+        value = 0.0625f * n;
+        matrices[0] = 0.03125f * n;
+        REQUIRE(pl_dispatch_run_prepared(handles[i], &run));
+        REQUIRE(pl_tex_download(gpu, pl_tex_transfer_params(.tex = out, .ptr = pixels)));
+        float expected = value + matrices[0] + (i ? 0.125f : 0.5f);
+        for (int x = 0; x < PL_ARRAY_SIZE(pixels); x++)
+            REQUIRE_CMP(pixels[x], ==, expected, "f");
+    }
+    pl_tex other = pl_tex_create(gpu, pl_tex_params(
+        .w = 8, .h = 8, .format = fmt, .storable = true,
+        .renderable = true, .host_readable = true));
+    REQUIRE(other);
+    // Record enough work to exhaust a descriptor pool, then change the
+    // specialization while the earlier pipeline can still be in use.
+    for (int n = 0; n < 32; n++)
+        REQUIRE(pl_dispatch_run_prepared_ex(handles[0], &run, true));
+    run.target = other;
+    REQUIRE(pl_dispatch_run_prepared_ex(handles[1], &run, true));
+    pl_gpu_flush(gpu);
+    REQUIRE(pl_tex_download(gpu, pl_tex_transfer_params(.tex = out, .ptr = pixels)));
+    for (int x = 0; x < PL_ARRAY_SIZE(pixels); x++)
+        REQUIRE_CMP(pixels[x], ==, value + matrices[0] + 0.5f, "f");
+    REQUIRE(pl_tex_download(gpu, pl_tex_transfer_params(.tex = other, .ptr = pixels)));
+    for (int x = 0; x < PL_ARRAY_SIZE(pixels); x++)
+        REQUIRE_CMP(pixels[x], ==, value + matrices[0] + 0.125f, "f");
+    REQUIRE(!pl_gpu_is_failed(gpu));
+    run.target = out;
+    REQUIRE_CMP(prepared_spy.creates, ==, 1, "d");
+    int runs = prepared_spy.runs;
+    run.num_variables = 1;
+    REQUIRE(!pl_dispatch_run_prepared(handles[0], &run));
+    run.num_variables = 2;
+    vars[0].var.dim_v = 2;
+    REQUIRE(!pl_dispatch_run_prepared(handles[0], &run));
+    vars[0].var.dim_v = 1;
+    run.target = tex;
+    REQUIRE(!pl_dispatch_run_prepared(handles[0], &run));
+    run.target = out;
+    desc.binding.object = out;
+    REQUIRE(!pl_dispatch_run_prepared(handles[0], &run));
+    desc.binding.object = tex;
+    REQUIRE_CMP(prepared_spy.runs, ==, runs, "d");
+
+    // Same format, dimensions and signature do not imply the same GLSL sampler.
+    struct pl_tex_t different_sampler = *tex;
+    REQUIRE_CMP(tex->sampler_signature, ==, 0, PRIu64);
+    prepared_spy.forbidden_object = &different_sampler;
+    desc.binding.object = &different_sampler;
+    for (int type = PL_SAMPLER_RECT; type <= PL_SAMPLER_EXTERNAL_YUV; type++) {
+        different_sampler.sampler_type = type;
+        REQUIRE(!pl_dispatch_run_prepared(handles[0], &run));
+        REQUIRE_CMP(prepared_spy.runs, ==, runs, "d");
+    }
+    desc.binding.object = tex;
+    prepared_spy.forbidden_object = NULL;
+
+    // Ordinary dispatch interleaves a different specialization with the pinned pass.
+    constant = 0.875f;
+    pl_dispatch_reset_frame(dp);
+    pl_shader sh = pl_dispatch_begin(dp);
+    REQUIRE(pl_shader_custom(sh, &custom));
+    REQUIRE(pl_dispatch_finish(dp, pl_dispatch_params(.shader = &sh, .target = out)));
+    REQUIRE(pl_dispatch_run_prepared(handles[0], &run));
+    REQUIRE(pl_tex_download(gpu, pl_tex_transfer_params(.tex = out, .ptr = pixels)));
+    REQUIRE_CMP(pixels[0], ==, value + matrices[0] + 0.5f, "f");
+    // Exceed the cache limit and age the held pass; reset must not evict it.
+    for (int n = 0; n < 110; n++) {
+        char body[80];
+        snprintf(body, sizeof(body), "color = vec4(%d.0);", n);
+        pl_dispatch_reset_frame(dp);
+        sh = pl_dispatch_begin(dp);
+        REQUIRE(pl_shader_custom(sh, &(struct pl_custom_shader) {
+            .body = body, .output = PL_SHADER_SIG_COLOR,
+            .compute = true, .compute_group_size = {8, 8},
+        }));
+        pl_dispatch_prepared tmp = pl_dispatch_prepare(dp,
+            pl_dispatch_params(.shader = &sh, .target = out));
+        REQUIRE(tmp);
+        pl_dispatch_prepared_destroy(&tmp);
+    }
+    int creates = prepared_spy.creates;
+    REQUIRE(pl_dispatch_run_prepared(handles[1], &run));
+    REQUIRE_CMP(prepared_spy.creates, ==, creates, "d");
+    REQUIRE(pl_tex_download(gpu, pl_tex_transfer_params(.tex = out, .ptr = pixels)));
+    REQUIRE_CMP(pixels[0], ==, value + matrices[0] + 0.125f, "f");
+    for (int i = 0; i < 2; i++) {
+        pl_dispatch_prepared_destroy(&handles[i]);
+        REQUIRE(!handles[i]);
+    }
+    // Targetless compute owns its storage binding, and may change it per run.
+    struct pl_shader_desc storage = {
+        .desc = {.name = "output_tex", .type = PL_DESC_STORAGE_IMG,
+                 .access = PL_DESC_ACCESS_WRITEONLY},
+        .binding = {.object = out},
+    };
+    sh = pl_dispatch_begin(dp);
+    REQUIRE(pl_shader_custom(sh, &(struct pl_custom_shader) {
+        .body = "imageStore(output_tex, ivec2(gl_GlobalInvocationID.xy), vec4(value));",
+        .input = PL_SHADER_SIG_NONE, .output = PL_SHADER_SIG_NONE,
+        .compute = true, .compute_group_size = {8, 8},
+        .descriptors = &storage, .num_descriptors = 1,
+        .variables = vars, .num_variables = 1,
+    }));
+    runs = prepared_spy.runs;
+    int writes = prepared_spy.writes, queries = prepared_spy.queries;
+    pl_dispatch_prepared none = pl_dispatch_prepare_compute(dp,
+        pl_dispatch_compute_params(.shader = &sh, .dispatch_size = {1, 1, 1}));
+    REQUIRE(none && !sh);
+    REQUIRE_CMP(prepared_spy.runs, ==, runs, "d");
+    REQUIRE_CMP(prepared_spy.writes, ==, writes, "d");
+    REQUIRE_CMP(prepared_spy.queries, ==, queries, "d");
+    creates = prepared_spy.creates;
+    for (int i = 0; i < 2; i++) {
+        value = i ? 0.75f : 0.25f;
+        storage.binding.object = i ? other : out;
+        REQUIRE(pl_dispatch_run_prepared(none, pl_dispatch_prepared_params(
+            .descriptors = &storage.binding, .num_descriptors = 1,
+            .variables = vars, .num_variables = 1)));
+    }
+    REQUIRE(pl_tex_download(gpu, pl_tex_transfer_params(.tex = out, .ptr = pixels)));
+    for (int i = 0; i < PL_ARRAY_SIZE(pixels); i++)
+        REQUIRE_CMP(pixels[i], ==, 0.25f, "f");
+    REQUIRE(pl_tex_download(gpu, pl_tex_transfer_params(.tex = other, .ptr = pixels)));
+    for (int i = 0; i < PL_ARRAY_SIZE(pixels); i++)
+        REQUIRE_CMP(pixels[i], ==, 0.75f, "f");
+    REQUIRE_CMP(prepared_spy.creates, ==, creates, "d");
+    runs = prepared_spy.runs;
+    REQUIRE(!pl_dispatch_run_prepared(none, pl_dispatch_prepared_params(
+        .descriptors = &storage.binding, .num_descriptors = 1,
+        .variables = vars, .num_variables = 1, .dispatch_size = {-1, 1, 1})));
+    REQUIRE_CMP(prepared_spy.runs, ==, runs, "d");
+    pl_dispatch_prepared_destroy(&none);
+    pl_tex_destroy(gpu, &other);
+
+    // Unsupported COLOR geometry is rejected and consumes the shader.
+    sh = pl_dispatch_begin(dp);
+    REQUIRE(pl_shader_custom(sh, &custom));
+    REQUIRE(!pl_dispatch_prepare(dp, pl_dispatch_params(
+        .shader = &sh, .target = out, .rect = {0, 0, 4, 4})));
+    REQUIRE(!sh);
+
+
+    pl_dispatch_destroy(&dp);
+    *fns = prepared_spy.original;
+    pl_tex_destroy(gpu, &tex);
+    pl_tex_destroy(gpu, &out);
+}
+
+
 static void snapshot_rejected(pl_dispatch dp, pl_shader src)
 {
     pl_shader dst = pl_dispatch_begin(dp);
@@ -6355,6 +6605,7 @@ static void shader_snapshot_tests(pl_gpu gpu)
 void gpu_shader_tests(pl_gpu gpu)
 {
     shader_snapshot_tests(gpu);
+    pl_prepared_tests(gpu);
     queue_field_duration_tests(gpu);
     pl_buffer_tests(gpu);
     pl_texture_tests(gpu);

@@ -814,6 +814,7 @@ static const struct pl_gpu_fns pl_fns_vk = {
     .pass_create            = vk_pass_create,
     .pass_destroy           = vk_pass_destroy,
     .pass_run               = vk_pass_run,
+    .pass_run_deferred      = vk_pass_run_deferred,
     .timer_create           = vk_timer_create,
     .timer_destroy          = vk_timer_destroy,
     .timer_query            = vk_timer_query,

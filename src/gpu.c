@@ -1110,7 +1110,8 @@ void pl_pass_destroy(pl_gpu gpu, pl_pass *pass)
     *pass = NULL;
 }
 
-void pl_pass_run(pl_gpu gpu, const struct pl_pass_run_params *params)
+void pl_pass_run_ex(pl_gpu gpu, const struct pl_pass_run_params *params,
+                    bool defer_submit)
 {
     pl_pass pass = params->pass;
     struct pl_pass_run_params new = *params;
@@ -1258,10 +1259,19 @@ void pl_pass_run(pl_gpu gpu, const struct pl_pass_run_params *params)
     }
 
     const struct pl_gpu_fns *impl = PL_PRIV(gpu);
-    impl->pass_run(gpu, &new);
+    if (defer_submit && impl->pass_run_deferred) {
+        impl->pass_run_deferred(gpu, &new);
+    } else {
+        impl->pass_run(gpu, &new);
+    }
 
 error:
     return;
+}
+
+void pl_pass_run(pl_gpu gpu, const struct pl_pass_run_params *params)
+{
+    pl_pass_run_ex(gpu, params, false);
 }
 
 void pl_gpu_flush(pl_gpu gpu)
