@@ -210,6 +210,7 @@ struct vk_ctx {
     PL_VK_FUN(GetQueryPoolResults);
     PL_VK_FUN(GetSemaphoreFdKHR);
     PL_VK_FUN(GetSwapchainImagesKHR);
+    PL_VK_FUN(GetPastPresentationTimingGOOGLE);
     PL_VK_FUN(InvalidateMappedMemoryRanges);
     PL_VK_FUN(MapMemory);
     PL_VK_FUN(QueuePresentKHR);

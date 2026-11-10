@@ -102,6 +102,12 @@ static const struct vk_ext vk_device_extensions[] = {
             {0}
         },
     }, {
+        .name = VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME,
+        .funs = (const struct vk_fun[]) {
+            PL_VK_DEV_FUN(GetPastPresentationTimingGOOGLE),
+            {0}
+        },
+    }, {
         .name = VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
         .funs = (const struct vk_fun[]) {
             PL_VK_DEV_FUN(CmdPushDescriptorSetKHR),
@@ -220,6 +226,7 @@ static const struct vk_ext vk_device_extensions[] = {
 
 // Make sure to keep this in sync with the above!
 const char * const pl_vulkan_recommended_extensions[] = {
+    VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME,
     VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
     VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
     VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME,
