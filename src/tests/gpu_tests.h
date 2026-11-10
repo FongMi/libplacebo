@@ -21,6 +21,7 @@
 
 #include <libplacebo/gpu.h>
 
+void pl_prepared_tests(pl_gpu gpu);
 void pl_buffer_tests(pl_gpu gpu);
 void pl_texture_tests(pl_gpu gpu);
 

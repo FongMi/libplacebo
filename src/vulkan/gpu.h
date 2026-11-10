@@ -183,3 +183,4 @@ int vk_desc_namespace(pl_gpu, enum pl_desc_type);
 pl_pass vk_pass_create(pl_gpu, const struct pl_pass_params *);
 void vk_pass_destroy(pl_gpu, pl_pass);
 void vk_pass_run(pl_gpu, const struct pl_pass_run_params *);
+void vk_pass_run_deferred(pl_gpu, const struct pl_pass_run_params *);
