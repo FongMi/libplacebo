@@ -182,6 +182,8 @@ struct pl_queue_params {
     // eventually resulted in a dropped or duplicated frame. (Though this can
     // be preferable to seeing that same phase drift result in a temporally
     // smeared image)
+    //
+    // A negative value disables the threshold and clears its hysteresis.
     double interpolation_threshold;
 
     // Specifies how long `pl_queue_update` will wait for frames to become
