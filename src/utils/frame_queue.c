@@ -882,7 +882,9 @@ static enum pl_queue_status interpolate(pl_queue p, struct pl_frame_mix *mix,
     // Silently disable interpolation if the ratio dips lower than the
     // configured threshold
     double ratio = fabs(p->fps.estimate / p->vps.estimate - 1.0);
-    if (ratio <= params->interpolation_threshold) {
+    if (params->interpolation_threshold < 0.0) {
+        p->threshold_frames = 0;
+    } else if (ratio <= params->interpolation_threshold) {
         if (!p->threshold_frames) {
             PL_INFO(p, "Detected fps ratio %.4f below threshold %.4f, "
                     "disabling interpolation",
